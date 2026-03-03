@@ -6,7 +6,7 @@ It moves data from a source database through automated pipelines into analytics-
 
 ---
 
-## What This Platform Does — In Plain English
+## What This Platform Does  
 
 Imagine a company has a PostgreSQL database that records customer orders, transactions, and events all day long.
 
