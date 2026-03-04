@@ -1,31 +1,34 @@
 # Enterprise Data Platform (EDP)
 
-A production-grade, cloud-native data platform built on AWS.
-It moves data from a source database through automated pipelines into analytics-ready datasets that power business dashboards.
+I built this project to learn and demonstrate production-grade data engineering on AWS. The idea is to take raw data from a database, move it through a series of cleaning and transformation steps, and make it available to business analysts through a dashboard - the same way it works inside real companies.
+
+This is not a simplified demo. I wanted to build the actual thing that data engineers build at work, which means it uses Terraform for infrastructure, multiple AWS services, distributed data processing with Spark, SQL transformations with dbt, orchestration with Airflow, and an AI agent to monitor and recover the pipeline when things go wrong.
+
+I know that sounds like a lot. The whole point of this README is to explain everything clearly and show the logical order to build it so it stops feeling overwhelming.
 
 ---
 
-## What This Platform Does — In Plain English
+## What this platform does
 
-Imagine a company has a PostgreSQL database that records customer orders, transactions, and events all day long.
+My data source is a PostgreSQL database. Think of it like a live application database where records are being inserted, updated, and deleted constantly throughout the day.
 
-The problem: that raw database data is not in a shape that analysts or dashboards can easily use. Analysts need clean, pre-aggregated data. They should not run queries directly against the production database.
+The problem with using that database directly for analytics is that it was not designed for it. Running heavy queries against a production database slows the application down, and the raw data is messy and hard to work with.
 
-This platform solves that by:
+This platform fixes that by doing the following:
 
-1. **Capturing every change** made to the source database (inserts, updates, deletes) in real time using CDC (Change Data Capture)
-2. **Landing that raw data** into an immutable storage layer (Bronze) so nothing is ever lost
-3. **Validating and cleaning** the raw data using Apache Spark (Bronze → Silver)
-4. **Routing bad records** to a Quarantine bucket for investigation rather than silently dropping them
-5. **Aggregating clean data** into business-level summaries using dbt and SQL (Silver → Gold)
-6. **Serving that Gold data** through Redshift Serverless so BI tools like Tableau, Power BI, or QuickSight can connect and build dashboards
-7. **Orchestrating the whole pipeline** automatically using Apache Airflow (MWAA) on a schedule
-8. **Logging everything** to CloudWatch for observability and alerting
-9. **Autonomously diagnosing and recovering** from pipeline failures using an AI Operations Agent that monitors every layer, finds the root cause across services, and takes corrective action without human intervention
+1. **Capturing every database change** in real time using a technique called CDC (Change Data Capture), so inserts, updates, and deletes are all tracked
+2. **Storing the raw captured data** into an immutable Bronze layer in S3, so the original data is never modified or lost
+3. **Cleaning and validating** the raw data with Apache Spark, turning it into structured records in a Silver layer
+4. **Sending any bad records** to a Quarantine area instead of silently dropping them, so data quality problems can be diagnosed
+5. **Aggregating the clean data** into business-level summaries in a Gold layer using SQL models written in dbt
+6. **Making the Gold data available** through Redshift Serverless so BI tools like Tableau, Power BI, or QuickSight can connect and build dashboards
+7. **Running the whole pipeline automatically** on a schedule using Apache Airflow
+8. **Logging everything** to CloudWatch so I can see what is happening at any point
+9. **Monitoring the pipeline with an AI agent** that watches every layer at once, figures out the real cause of failures, and automatically recovers the pipeline when common problems occur
 
 ---
 
-## Architecture Diagram
+## Architecture diagram
 
 ```
                 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
@@ -78,290 +81,347 @@ This platform solves that by:
 
 ---
 
-## The AI Operations Agent — Why It Exists
+## How I'm building this from start to finish
 
-This platform moves data across five hops: DMS → Bronze → Glue → Silver → dbt → Gold → Redshift.
-When something breaks, no single AWS service can see the full picture.
+When I first looked at everything this platform needs, it felt like too much to take on at once. There are infrastructure resources to create, code to write, services to connect, and tools I had never used before all at the same time.
 
-CloudWatch sees individual alarms. Airflow retries individual tasks. Neither service can reason about a failure
-that spans multiple layers at once.
+The thing that made it manageable was realizing there is a strict logical order to it. You cannot fill a bucket that does not exist yet. You cannot run a Spark job against a database that has not been created. Every piece has a prerequisite, and once I mapped the order out, it became a straightforward checklist instead of a pile of complexity.
 
-**The problem looks like this in practice:**
+I split the work into two phases. Phase 1 is all infrastructure. Phase 2 is all application code on top of that infrastructure.
+
+---
+
+### Phase 1: Infrastructure with Terraform
+
+Terraform is the tool I use to create all the AWS resources. Instead of clicking through the AWS console, I write code that describes what I want, and Terraform creates it. This means I can destroy everything at the end of a session to save money and recreate it exactly the same way next time.
+
+Everything in Phase 1 lives in the `terraform-platform-infra-live` directory, organized as modules. Each module has one job.
+
+**Step 1 - Remote state storage**
+
+Before Terraform can work reliably, it needs a place to store a file called `terraform.tfstate`. This file is how Terraform tracks what it has already created so it does not try to create things twice.
+
+I store this file in S3 with a DynamoDB table handling the locking, so it is safe and consistent. This setup lives in `terraform-bootstrap` and runs once per AWS account before anything else. It is the only thing that has to be done before the main infrastructure.
+
+**Step 2 - Networking**
+
+I create a VPC, which is a private network inside AWS that all my resources will live in. Along with the VPC, I create subnets, route tables, and an S3 VPC endpoint. The S3 endpoint is important because it lets services inside the VPC talk to S3 without going out to the public internet.
+
+Nothing else can be created without a network to put it in, so this always comes first.
+
+**Step 3 - Data lake storage**
+
+I create the five S3 buckets: Bronze, Silver, Gold, Quarantine, and a fifth one for Athena query results. These are just empty buckets at this point. No data is in them yet. But they need to exist before any of the services that write to them can be set up.
+
+**Step 4 - Permissions and metadata**
+
+I create a KMS encryption key that will encrypt all data at rest across the platform. I also create the IAM roles for every service that needs one: Glue, Airflow, Redshift, DMS, and the ECS task for the AI agent. Each role only has permission to do exactly what that service needs.
+
+I also create three Glue Data Catalog databases here, one for Bronze, one for Silver, and one for Gold. These are metadata containers that describe the schema of the data in each layer. Glue and Athena both use these to understand the structure of the data they are reading.
+
+**Step 5 - Data source and CDC**
+
+I create the RDS PostgreSQL database that acts as my source system. This is the database that the CDC process will read changes from.
+
+I also create the DMS replication instance and replication task. DMS connects to PostgreSQL, reads its write-ahead log (the internal journal PostgreSQL keeps of every change), and converts those changes into Parquet files that land in the Bronze S3 bucket. This is where data ingestion begins.
+
+One important thing: after the first Terraform apply, the RDS instance needs a reboot to activate logical replication mode. This is a one-time manual step. The DMS task also needs to be started manually after the infrastructure is applied. Both of these are documented in the ingestion module README.
+
+**Step 6 - Processing configuration**
+
+I create the Glue security configuration, which controls how Glue encrypts data while it is working, and the Athena workgroup, which controls where Athena writes query results and how much data queries are allowed to scan.
+
+These are settings containers. The actual Glue PySpark code and the dbt SQL models come in Phase 2. At this point I'm just setting up the environment they will run in.
+
+**Step 7 - Serving layer**
+
+I create the Redshift Serverless namespace and workgroup. This is the data warehouse that analysts will eventually query. At this point it is empty and has no data in it, but it exists and it can read directly from the Gold S3 bucket using Redshift Spectrum once data starts flowing.
+
+**Step 8 - Orchestration**
+
+I create the MWAA environment, which is the managed Airflow service on AWS. Airflow is what runs the pipeline on a schedule and controls the order that things run in. I also create the ECS cluster and task definition for the AI Operations Agent.
+
+One note on MWAA: it costs about $0.49 per hour, which adds up quickly. I only spin this up when I need to test orchestration or record a demo. For day-to-day development of DAGs, I run Airflow locally.
+
+Once all eight infrastructure steps are done, everything is in place. The VPC exists, the buckets exist, the database exists, DMS is set up, the processing environment is configured, Redshift is ready, and Airflow is running. No data is flowing yet but the whole scaffolding is there.
+
+---
+
+### Phase 2: Application code
+
+This is where I write the code that actually moves and transforms data. The infrastructure from Phase 1 is the foundation. Everything in Phase 2 runs on top of it.
+
+**Step 9 - PySpark transformation jobs (platform-glue-jobs)**
+
+I write the PySpark code that runs inside AWS Glue. This job reads Parquet files from Bronze, validates each record against the expected schema, applies the CDC operations correctly (so a record that was inserted and then deleted ends up being deleted in Silver, not duplicated), and writes the clean result to Silver. Any record that fails schema validation or has data quality issues gets written to Quarantine instead.
+
+This is the Bronze to Silver transformation. It is the most complex piece of code in the project because it has to handle all the different CDC operation types correctly.
+
+**Step 10 - SQL transformation models (platform-dbt-analytics)**
+
+I write dbt models, which are just SQL files with some extra structure. These read from Silver through Athena and produce business-level aggregations that go into Gold. Things like daily revenue by product, monthly active users, weekly order volumes.
+
+dbt handles dependency ordering between models automatically, so if one model depends on another, dbt figures out which one to run first. It also generates documentation and can run data quality tests on the output.
+
+**Step 11 - Airflow DAGs (platform-orchestration-mwaa-airflow)**
+
+I write the DAGs that orchestrate the whole sequence. A DAG is a Python file that defines a set of tasks and the order they run in. My main pipeline DAG looks roughly like this:
+
+```
+start_dms_check -> trigger_glue_job -> wait_for_glue -> trigger_dbt -> verify_gold -> notify_success
+```
+
+If any task fails, the DAG stops and an alert fires. Airflow handles retries, scheduling, and the task dependency graph automatically.
+
+**Step 12 - CDC simulator (platform-cdc-simulator)**
+
+I write a Python script that generates realistic PostgreSQL changes: inserts of new orders, updates to existing records, and deletes. This lets me test the full pipeline without needing a real application connected to the database. I can control the volume and type of changes to test edge cases.
+
+**Step 13 - AI Operations Agent (platform-ops-agent)**
+
+I build the Python application that monitors the pipeline and handles incident recovery. I cover this in its own section below.
+
+---
+
+### Phase 3: End-to-end validation
+
+**Step 14 - Full pipeline test in dev**
+
+I run the CDC simulator to generate data, trigger the Airflow DAG, and watch data move from PostgreSQL all the way to a queryable result in Redshift. When this works end to end, the project is functionally complete.
+
+**Step 15 - Staging and prod confirmation**
+
+I deploy to staging and then prod just to confirm the Terraform modules work correctly in those environments. I destroy both immediately after confirming. Active development only happens in dev.
+
+---
+
+That is the full build. Thirteen steps across two phases, plus a final validation. Written out it looks like a lot but each step is self-contained, has a clear purpose, and follows directly from the previous one. The reason I wrote it this way is because looking at the architecture diagram without this ordering made the whole thing feel like a wall. With the ordering, it becomes a checklist.
+
+---
+
+## The AI Operations Agent
+
+When data moves through five separate services (DMS, Glue, dbt, Redshift, Airflow) and something goes wrong, the failure often shows up in a different place than where it started. Here is a real example of what that looks like:
 
 ```
 DMS replication lag spikes
-  → Glue job reads stale Bronze data
-    → Silver state falls behind
-      → dbt runs on incomplete Silver
-        → Gold aggregations are wrong
-          → BI dashboard shows incorrect numbers
+  and Glue reads empty Bronze files
+    and Silver never gets updated
+      and dbt runs on stale Silver data
+        and Gold aggregations are wrong
+          and the dashboard shows incorrect numbers
 ```
 
-Each service sees one symptom. Only something that watches all layers simultaneously can find the root cause.
+CloudWatch fires an alarm in DMS. Airflow retries the Glue task. But neither of them knows that the Glue failure and the DMS alarm are related. An engineer looking at these alerts in isolation would probably start debugging Glue first, which is the wrong place.
 
-### What the Agent Does
+The AI Operations Agent solves this. It watches every layer at once and reasons across all of them before deciding what to do.
 
-The AI Operations Agent is a Python application backed by Claude (Anthropic's AI model) and the AWS SDK.
-It runs as a long-lived process and subscribes to events from every layer of the platform.
+### How it works
 
-**Monitoring**
+The agent is a Python application running as an ECS Fargate container. It subscribes to EventBridge rules that fire whenever something notable happens in DMS, Glue, Athena, Airflow, or Redshift.
 
-The agent subscribes to CloudWatch EventBridge rules for:
-- DMS replication task state changes and lag metrics
-- Glue job run state changes (FAILED, STOPPED, TIMEOUT)
-- Airflow task instance failures (via CloudWatch log filters)
-- Athena query failures and timeout events
-- Redshift Serverless compute capacity events
+When an event fires, the agent does not just react to that single event. It calls the AWS SDK across multiple services at the same time to get the full picture before taking any action.
 
-**Diagnosis**
-
-When an event fires, the agent does not just look at that one event in isolation. It calls the AWS SDK
-across multiple services simultaneously to build a full picture:
+Here is what it does when a Glue job failure event arrives:
 
 ```
-Event: Glue job failed
-Agent calls:
-  → DMS describe-replication-tasks     (is there a replication lag causing empty Bronze?)
-  → S3 list-objects Bronze partition   (did any files actually land in the expected window?)
-  → CloudWatch get-metric-statistics   (is this a one-off or a pattern of failures?)
-  → Glue get-job-runs (last 5)         (did the previous runs succeed with normal duration?)
-Conclusion: "Bronze was empty because DMS task paused 47 minutes ago. This is not a Glue bug."
+Event received: Glue job failed
+
+Agent checks simultaneously:
+  - DMS: what is the current replication lag?
+  - S3: how many files actually landed in Bronze for this time window?
+  - CloudWatch: has this happened before in the last 24 hours?
+  - Glue: what did the last 5 job runs look like?
+
+Conclusion: Bronze had zero files because DMS paused 47 minutes ago.
+            The Glue job did not fail because of a code bug.
+            The root cause is a DMS health issue.
+
+Action: Pause downstream Glue jobs to stop them running pointlessly.
+        Alert specifically on DMS, not Glue.
+        Schedule a Glue retry for when DMS recovers.
 ```
 
-This multi-step reasoning is what makes the agent genuinely useful — it crosses service boundaries that
-no single AWS alarm or Airflow retry can cross.
+This cross-service reasoning is what makes the agent useful. No individual AWS alarm or Airflow retry can do this because they each only see one part of the picture.
 
-**Action**
+### What the agent does in each scenario
 
-After diagnosis, the agent takes the appropriate remediation action:
-
-| Situation | Agent Action |
+| Situation | What the agent does |
 |---|---|
-| Upstream DMS lag is the root cause | Pause downstream Glue jobs to prevent cascading failures; alert on DMS health |
-| Glue job failed due to bad Bronze record | Move the offending file to Quarantine S3; re-trigger Glue on the remaining files |
-| dbt model failed on stale Silver data | Delay dbt run; trigger Airflow backfill once Silver catches up |
-| Transient Glue error (network timeout) | Trigger a single retry via Airflow REST API with exponential backoff |
-| Unknown failure pattern | Escalate immediately with full context; do not attempt auto-remediation |
+| DMS lag is the root cause | Pauses downstream Glue jobs to prevent empty runs |
+| A bad Bronze file caused Glue to fail | Moves the bad file to Quarantine, re-triggers Glue on the rest |
+| dbt ran on incomplete Silver data | Delays dbt, schedules a backfill once Silver catches up |
+| Transient network error in Glue | Triggers a single retry through the Airflow REST API |
+| Unknown failure pattern | Escalates with full context, does not attempt auto-recovery |
 
-**Reporting**
-
-Every incident produces a structured report sent via SNS (email/Slack):
+Every incident produces a plain-English report sent via SNS:
 
 ```
-INCIDENT REPORT — 2024-03-15 02:17 UTC
-Root cause: DMS task edp-dev-replication paused (replication lag: 47 min)
-Impact: Bronze partition 2024-03-15/orders contains 0 files
-Action taken: Glue job edp-dev-bronze-to-silver paused until DMS recovers
-Action taken: Glue job edp-dev-bronze-to-silver scheduled to retry at 03:00 UTC
-Manual action needed: Investigate DMS task — may need RDS WAL retention increase
-Confidence: HIGH (pattern matches 3 previous incidents)
+INCIDENT REPORT - 2024-03-15 02:17 UTC
+Root cause: DMS task edp-dev-replication paused (lag: 47 min)
+Impact: Bronze partition 2024-03-15/orders has 0 files
+Action taken: Glue job paused until DMS recovers
+Action taken: Glue retry scheduled for 03:00 UTC
+Manual action needed: Check DMS task - may need RDS WAL retention increase
+Confidence: HIGH
 ```
 
-### What the Agent Does NOT Do
+### What the agent does not do
 
-The agent is deliberately scoped to operations and recovery. It does not:
-- Modify Terraform infrastructure
-- Change dbt model logic or Glue PySpark code
-- Make decisions in production without a human-readable audit trail
-- Auto-remediate if it cannot explain the root cause with HIGH confidence
-
-### Where It Lives
-
-The agent lives in its own repository: `platform-ops-agent/`
-
-It is deployed as an ECS Fargate task (always-on, low cost) and integrates with the existing infrastructure
-via EventBridge rules and IAM roles that are defined in the `orchestration` Terraform module.
+The agent is deliberately limited to operations and recovery. It does not modify Terraform infrastructure, change Glue code or dbt models, or attempt auto-recovery on anything it cannot explain with high confidence. Everything it does is logged with a clear reason.
 
 ---
 
-## The Medallion Architecture Explained
+## The data lake layers (Medallion Architecture)
 
-The data lake uses a pattern called **Medallion Architecture**. Each layer is a separate S3 bucket with a specific purpose.
+The data lake follows a pattern called Medallion Architecture. Each layer is a separate S3 bucket and has a specific job.
 
-### Bronze — The Immutable Raw Layer
+### Bronze: raw and immutable
 
-**What lands here:** Every CDC event from DMS exactly as it arrived. No changes, no filtering.
+Everything that comes out of DMS lands here exactly as it arrived. I never modify Bronze data. If I find a bug in my Glue transformation code six months from now, I can re-process everything from Bronze without losing any original data. Bronze is the source of truth for the whole platform.
 
-**Why immutable:** If a bug is discovered in the Silver or Gold transformation logic, engineers can re-process from Bronze without losing any original data. Bronze is the source of truth.
+Data is stored as Parquet files, partitioned by date with one folder per source table.
 
-**Format:** Parquet files partitioned by date, one folder per source table.
+### Silver: clean and structured
 
-### Silver — The Reconstructed State
+This is the output of the Glue PySpark job. It reads Bronze, validates each record, applies CDC operations correctly so the current state of each record is accurate, and writes the result here. Records that fail validation go to Quarantine instead. Silver represents the current real state of the source database.
 
-**What lands here:** Clean, validated, deduplicated records. Each row represents the current state of a record (the CDC deletes and updates have been resolved into a consistent snapshot).
+### Gold: business-ready aggregations
 
-**How it gets here:** An AWS Glue PySpark job reads Bronze, applies schema validation, deduplicates records, handles CDC operation types (INSERT/UPDATE/DELETE), and writes clean data to Silver. Any record that fails validation goes to Quarantine instead.
+This is what analysts actually query. dbt reads Silver through Athena and runs SQL models that produce things like daily revenue by product, monthly active users, and weekly order volumes. Gold is pre-aggregated so dashboards load fast and analysts are not running expensive queries against raw data.
 
-### Gold — Business Aggregations
+### Quarantine: the bad records
 
-**What lands here:** Pre-aggregated, business-level datasets. Examples: daily revenue by product, monthly active users, weekly inventory levels.
+Any record that fails Silver validation ends up here instead of being silently dropped. Silent data loss is much worse than visible data quality problems. With Quarantine I can go back, see exactly what failed, and fix the problem at the source. The AI agent can also route records here directly during incident recovery.
 
-**How it gets here:** dbt (data build tool) runs SQL models that read from Silver via Athena and write aggregated results to Gold.
+### Athena results
 
-### Quarantine — Invalid Records
-
-**What lands here:** Any record that failed Silver validation (missing required fields, wrong data types, referential integrity violations, etc.).
-
-**Why keep bad records:** So engineers can diagnose data quality problems at the source rather than silently dropping data. The AI Operations Agent can also directly route records here during incident recovery.
-
-### Athena Results
-
-**What lands here:** Query result files from Amazon Athena SQL queries. This bucket acts as the designated output location for all Athena workgroup queries.
+Athena writes query result files here whenever it runs a SQL query. This is just a designated output location for the Athena workgroup.
 
 ---
 
-## Data Flow — Step by Step
+## How data moves through the system
 
 ```
-Step 1: Source
-  PostgreSQL database has new activity (insert/update/delete)
+Step 1:  A change happens in the PostgreSQL database (insert, update, or delete)
 
-Step 2: CDC Capture
-  AWS DMS (Database Migration Service) captures that change
-  and writes it as a Parquet file to the Bronze S3 bucket
-  The file includes: the changed row + the operation type (I/U/D) + timestamp
+Step 2:  AWS DMS reads that change from PostgreSQL's internal write-ahead log
+         and writes it as a Parquet file to the Bronze S3 bucket
+         Each file contains the row data, the operation type, and a timestamp
 
-Step 3: Orchestration triggers
-  MWAA (Airflow) detects it is time to process Bronze data
-  It starts a Glue Spark job
+Step 3:  Airflow detects it is time to run the pipeline and triggers the Glue job
 
-Step 4: Glue Spark processes Bronze → Silver
-  The Glue job reads the Bronze Parquet files
-  For each record:
-    - Validates schema and required fields
-    - Resolves CDC operations (merge inserts/updates/deletes into current state)
-    - If valid → writes to Silver bucket
-    - If invalid → writes to Quarantine bucket
+Step 4:  The Glue PySpark job reads Bronze
+         Each record is validated:
+           - If valid, it is written to Silver
+           - If invalid, it is written to Quarantine
 
-Step 5: Airflow triggers dbt
-  After Glue completes, MWAA starts the dbt transformation
+Step 5:  Airflow detects the Glue job finished and triggers dbt
 
-Step 6: dbt transforms Silver → Gold
-  dbt runs SQL models using Athena as the query engine
-  Silver data is aggregated into business-level summaries
-  Results are written to the Gold bucket
+Step 6:  dbt runs SQL models using Athena as the query engine
+         Silver data is aggregated into Gold summaries
 
-Step 7: Redshift reads Gold
-  Redshift Serverless uses Redshift Spectrum to query Gold S3 data
-  as if it were internal Redshift tables (no data loading required)
+Step 7:  Redshift Serverless uses Spectrum to read Gold directly from S3
+         No data loading required - Spectrum queries S3 as if it were a Redshift table
 
-Step 8: BI Dashboard connects to Redshift
-  Tableau / Power BI / QuickSight connects to Redshift endpoint
-  Analysts query Gold data and build dashboards
+Step 8:  BI tools connect to Redshift and analysts build dashboards on Gold data
 
-Step 9: Monitoring
-  Every step writes logs to CloudWatch
-  EventBridge rules convert log patterns into structured events
+Step 9:  Every step above writes logs to CloudWatch
+         EventBridge converts log patterns into structured events
 
-Step 10: AI Operations Agent (continuous)
-  The agent receives all EventBridge events in real time
-  For each failure event it:
-    - Queries multiple AWS services simultaneously to build a full cross-layer picture
-    - Identifies the root cause (not just the symptom)
-    - Takes the appropriate remediation action (pause, re-route, retry, escalate)
-    - Writes a human-readable incident report to SNS
-  This runs continuously and in parallel with all other steps
+Step 10: The AI Operations Agent receives all EventBridge events in real time
+         For any failure it diagnoses the root cause, takes the right action,
+         and sends a plain-English incident report via SNS
+         This runs continuously alongside all other steps
 ```
 
 ---
 
-## Technology Stack
+## Tools and technologies
 
-| Technology | What It Is | Role in This Platform |
+| Tool | What it is | How I use it |
 |---|---|---|
-| **Terraform** | Infrastructure-as-Code tool | Provisions all AWS resources reproducibly |
-| **AWS S3** | Cloud object storage | Hosts the Bronze/Silver/Gold/Quarantine data lake |
-| **PostgreSQL on RDS** | Relational database | The source system (simulates a real application DB) |
-| **AWS DMS** | Database Migration Service | Captures CDC events from PostgreSQL and writes to Bronze |
-| **AWS Glue** | Managed Apache Spark service | Runs PySpark jobs to transform Bronze → Silver |
-| **Apache Spark (PySpark)** | Distributed data processing engine | The runtime inside Glue jobs |
-| **dbt** | Data Build Tool | Runs SQL transformations Silver → Gold using Athena |
-| **Amazon Athena** | Serverless SQL query engine | Executes dbt SQL models against S3 data |
-| **Redshift Serverless** | Serverless data warehouse | Serves analytics queries via JDBC/ODBC |
-| **Redshift Spectrum** | Redshift feature | Queries S3 Gold data as external tables |
-| **Amazon MWAA** | Managed Apache Airflow | Orchestrates and schedules the pipeline |
-| **Apache Airflow** | Workflow orchestration | DAGs define pipeline order and dependencies |
-| **AWS KMS** | Key Management Service | Encrypts data at rest across all services |
-| **AWS IAM** | Identity and Access Management | Controls who/what can access each service |
-| **AWS Glue Catalog** | Metadata catalog | Stores table schemas for Bronze/Silver/Gold |
-| **CloudWatch + EventBridge** | AWS monitoring service | Logs, metrics, and structured events for all components |
-| **Amazon ECS Fargate** | Serverless container runtime | Runs the AI Operations Agent as an always-on process |
-| **Claude (Anthropic)** | Large language model | Powers the AI agent's cross-service reasoning and incident reports |
-| **VPC** | Virtual Private Cloud | Private network that isolates all compute |
+| Terraform | Infrastructure-as-Code | Creates all AWS resources from code |
+| AWS S3 | Cloud object storage | Holds all data lake layers |
+| PostgreSQL on RDS | Relational database | The data source |
+| AWS DMS | Database Migration Service | Captures CDC events and writes to Bronze |
+| AWS Glue | Managed Spark service | Runs PySpark jobs for Bronze to Silver |
+| Apache Spark (PySpark) | Distributed processing engine | The runtime inside Glue |
+| dbt | Data Build Tool | SQL models for Silver to Gold |
+| Amazon Athena | Serverless SQL engine | Executes dbt SQL against S3 data |
+| Redshift Serverless | Serverless data warehouse | Serves analyst queries |
+| Redshift Spectrum | Redshift feature | Queries Gold S3 as external tables |
+| Amazon MWAA | Managed Airflow | Orchestrates and schedules the pipeline |
+| Apache Airflow | Workflow engine | DAGs define task order and dependencies |
+| AWS KMS | Key Management Service | Encrypts all data at rest |
+| AWS IAM | Identity and Access Management | Controls what each service is allowed to do |
+| AWS Glue Catalog | Metadata catalog | Stores table schemas for Bronze, Silver, Gold |
+| CloudWatch and EventBridge | Monitoring | Logs and structured events from every layer |
+| ECS Fargate | Serverless containers | Runs the AI Operations Agent |
+| Claude (Anthropic) | Large language model | Powers the agent's cross-service reasoning |
+| VPC | Virtual Private Cloud | Isolates all compute in a private network |
 
 ---
 
-## Repository Structure
-
-This project is split across multiple repositories, each with a single responsibility:
+## Repository layout
 
 ```
 enterprise-data-platform/
 │
-├── README.md                          ← You are here
+├── README.md                              (this file)
 │
-├── terraform-bootstrap/               ← STEP 1: Run this first
-│   Purpose: Creates remote Terraform state storage (S3 + DynamoDB)
-│   for each AWS account before any other infrastructure is provisioned.
+├── terraform-bootstrap/                   BUILD STEP 1
+│   Creates S3 buckets and DynamoDB tables for Terraform remote state.
+│   Run this once per AWS account before anything else.
 │
-├── terraform-platform-infra-live/     ← STEP 2: Run this second
-│   Purpose: Provisions all AWS infrastructure (VPC, S3 buckets, IAM,
-│   RDS, DMS, Glue, Redshift, MWAA, ECS) across dev/staging/prod environments.
+├── terraform-platform-infra-live/         BUILD STEPS 2 to 8
+│   All AWS infrastructure, organized as Terraform modules.
+│   VPC, S3 buckets, RDS, DMS, Glue, Redshift, MWAA, and ECS all live here.
 │
-├── platform-glue-jobs/                ← STEP 3: Deploy after infra
-│   Purpose: PySpark code that runs inside AWS Glue.
-│   Handles Bronze → Silver transformation and quarantine logic.
+├── platform-glue-jobs/                    BUILD STEP 9
+│   PySpark code that runs inside AWS Glue.
+│   Handles Bronze to Silver transformation and quarantine routing.
 │
-├── platform-dbt-analytics/            ← STEP 4: Deploy after Glue
-│   Purpose: dbt SQL models that transform Silver → Gold.
+├── platform-dbt-analytics/                BUILD STEP 10
+│   dbt SQL models that transform Silver to Gold.
 │   Uses Athena as the query engine.
 │
-├── platform-orchestration-mwaa-airflow/  ← STEP 5: Deploy after dbt
-│   Purpose: Apache Airflow DAGs that orchestrate the full pipeline.
-│   Controls when Glue jobs run and when dbt runs.
+├── platform-orchestration-mwaa-airflow/   BUILD STEP 11
+│   Airflow DAGs that orchestrate the full pipeline.
+│   Controls when Glue runs, when dbt runs, and what happens on failure.
 │
-├── platform-ops-agent/                ← STEP 6: Deploy after orchestration
-│   Purpose: AI Operations Agent that monitors all pipeline layers,
-│   diagnoses cross-service failures, and autonomously recovers the pipeline.
-│   Built with Python, the Claude API, and the AWS SDK.
-│   Runs as an ECS Fargate task subscribed to CloudWatch EventBridge.
+├── platform-cdc-simulator/                BUILD STEP 12
+│   Script that generates synthetic PostgreSQL changes for testing.
 │
-├── platform-cdc-simulator/            ← Used for testing
-│   Purpose: Generates synthetic PostgreSQL change events
-│   to test the pipeline end-to-end without a real application.
+├── platform-ops-agent/                    BUILD STEP 13
+│   The AI Operations Agent.
+│   Python app that monitors the pipeline and recovers from failures.
 │
-└── platform-docs/                     ← Documentation
-    Purpose: Additional architecture docs, runbooks, and diagrams.
+└── platform-docs/
+    Additional diagrams, runbooks, and architecture notes.
 ```
 
 ---
 
-## AWS Account Strategy
+## AWS accounts
 
-This platform runs across **three separate AWS accounts**:
+I run this across three separate AWS accounts:
 
-| Account | Purpose | AWS CLI Profile |
+| Account | Purpose | CLI profile |
 |---|---|---|
-| **dev** | Development and testing. Safe to break things. | `dev-admin` |
-| **staging** | Pre-production validation. Mirrors prod config. | `staging-admin` |
-| **prod** | Live production. Protected. Limited access. | `prod-admin` |
+| dev | Where I build and test. Safe to break. | dev-admin |
+| staging | Used only to confirm staging deploys correctly, then destroyed | staging-admin |
+| prod | Used only to confirm prod deploys correctly, then destroyed | prod-admin |
 
-Each account has its own:
-- Terraform remote state bucket (from `terraform-bootstrap`)
-- VPC and networking
-- S3 data lake buckets
-- IAM roles and KMS keys
-- Glue, MWAA, Redshift environments
-- AI Operations Agent ECS task
+Separate accounts are the strongest isolation AWS offers. A mistake in dev cannot touch prod. Unexpected costs in staging do not affect prod billing.
 
-**Why separate accounts?**
-Account-level isolation is the strongest security boundary in AWS. A misconfiguration in dev cannot affect prod. A cost spike in staging does not impact prod billing. This is standard enterprise practice.
+My active development only happens in dev. I spin up staging and prod occasionally to confirm the Terraform modules deploy cleanly, then destroy them to keep costs near zero.
 
 ---
 
-## VPC CIDR Allocation
+## Network layout
 
-Each environment has its own non-overlapping IP range:
+Each environment gets its own IP address range so they never overlap:
 
 | Environment | VPC CIDR | Private Subnet A | Private Subnet B |
 |---|---|---|---|
@@ -369,506 +429,294 @@ Each environment has its own non-overlapping IP range:
 | staging | 10.20.0.0/16 | 10.20.16.0/20 | 10.20.32.0/20 |
 | prod | 10.30.0.0/16 | 10.30.16.0/20 | 10.30.32.0/20 |
 
-Non-overlapping ranges allow future VPC peering between accounts if needed.
+Non-overlapping ranges mean I can peer these networks together in the future if needed.
 
 ---
 
-## Infrastructure Module Map
+## Terraform module map
 
-Inside `terraform-platform-infra-live`, the infrastructure is organized as reusable modules:
+Inside `terraform-platform-infra-live`, the infrastructure is split into modules. Each module has one responsibility and can be understood on its own.
 
 ```
 modules/
-├── networking/       Creates VPC, subnets, route tables, S3 endpoint
-├── data-lake/        Creates all 5 S3 medallion buckets
-├── iam-metadata/     Creates KMS key, IAM roles, Glue Catalog databases
-├── ingestion/        Creates RDS PostgreSQL + DMS for CDC
-├── processing/       Creates Glue security config, Glue connection, Athena workgroup
-├── serving/          Creates Redshift Serverless namespace + workgroup
-└── orchestration/    Creates MWAA environment, DAGs bucket, ECS cluster for AI agent, CloudWatch log groups
+├── networking/     VPC, subnets, route tables, S3 VPC endpoint
+├── data-lake/      All 5 S3 data lake buckets
+├── iam-metadata/   KMS key, IAM roles, Glue Catalog databases
+├── ingestion/      RDS PostgreSQL and DMS replication instance and task
+├── processing/     Glue security config, Glue VPC connection, Athena workgroup
+├── serving/        Redshift Serverless namespace and workgroup
+└── orchestration/  MWAA environment, ECS cluster, CloudWatch log groups
 ```
 
-Each environment (dev/staging/prod) calls all of these modules with environment-specific values.
-
-The modules depend on each other in this order:
+The modules depend on each other in this order. Each one uses outputs from the ones above it:
 
 ```
-networking  ──────────────────────────────────────────────────────┐
-                                                                   │
-data-lake   ──────────────────────────────────────────────────────┤
-                                                                   │
-iam-metadata  (uses bucket names from data-lake) ─────────────────┤
-                                                                   ├──► ingestion
-ingestion   (uses vpc, subnets, kms, buckets)                      ├──► processing
-                                                                   ├──► serving
-processing  (uses vpc, subnets, kms, glue role, buckets)           └──► orchestration
-serving     (uses vpc, subnets, kms, redshift role)
-orchestration (uses vpc, subnets, kms, mwaa role, ecs task for AI agent)
+networking
+  └── data-lake
+        └── iam-metadata
+              ├── ingestion
+              ├── processing
+              ├── serving
+              └── orchestration
 ```
 
 ---
 
-## Prerequisites — What You Need Before Starting
+## What I need to run this
 
-### 1. AWS Accounts
+- Three AWS accounts (or just one if learning, using dev environment only)
+- AWS CLI v2: `aws --version` should show 2.x
+- Terraform 1.6 or higher: `terraform --version`
+- AWS SSO profiles configured for dev-admin, staging-admin, and prod-admin
+- Python 3.9 or higher: `python --version`
+- dbt CLI: `pip install dbt-athena-community`
+- Anthropic API key for the AI agent, stored as the `ANTHROPIC_API_KEY` environment variable
 
-You need three AWS accounts. In a real enterprise, these are created under an AWS Organization.
-For learning, a single AWS account can be used by changing the environment name.
-
-### 2. AWS CLI v2
-
-```bash
-aws --version
-# Must show: aws-cli/2.x.x
-```
-
-Install from: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
-
-### 3. Terraform
-
-```bash
-terraform --version
-# Must show: Terraform v1.6.0 or higher
-```
-
-Install from: https://developer.hashicorp.com/terraform/install
-
-### 4. AWS SSO Profiles
-
-You need three CLI profiles configured (one per account):
-
-```bash
-# Configure dev profile
-aws configure sso --profile dev-admin
-
-# Configure staging profile
-aws configure sso --profile staging-admin
-
-# Configure prod profile
-aws configure sso --profile prod-admin
-```
-
-See `terraform-bootstrap/README.md` for the full SSO setup walkthrough.
-
-### 5. Python 3.9+
-
-Required for local testing of Glue PySpark jobs and the AI Operations Agent.
-
-```bash
-python --version
-```
-
-### 6. dbt CLI
-
-Required for running dbt models locally.
-
-```bash
-pip install dbt-athena-community
-dbt --version
-```
-
-### 7. Anthropic API Key
-
-Required to run the AI Operations Agent locally. Get a key from the Anthropic Console.
-
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-```
+For the full SSO setup walkthrough, see `terraform-bootstrap/README.md`.
 
 ---
 
-## Getting Started — Deployment Order
+## Running the infrastructure
 
-Follow this exact order. Each step depends on the previous one.
-
-### Step 1 — Bootstrap Remote State
+Follow the build steps in order. Each depends on everything before it.
 
 ```bash
-cd terraform-bootstrap
-# Read: terraform-bootstrap/README.md for full instructions
-aws sso login --profile dev-admin
-cd environments/dev
+# Step 1: Set up remote state (run once per account)
+cd terraform-bootstrap/environments/dev
 terraform init
 terraform apply
-```
 
-Repeat for staging and prod.
-
-**What this creates:** S3 bucket + DynamoDB table in each account to store Terraform state remotely.
-
-### Step 2 — Deploy Platform Infrastructure
-
-```bash
+# Steps 2 to 8: Deploy all infrastructure
 cd terraform-platform-infra-live
-# Read: terraform-platform-infra-live/README.md for full instructions
-aws sso login --profile dev-admin
-
-# Using the Makefile:
 make init dev
 make plan dev
 make apply dev
+
+# Destroy dev when done to avoid unnecessary costs
+make destroy dev
 ```
 
-The Makefile targets available are:
+Available make commands:
 
-| Command | What it does |
+| Command | What it runs |
 |---|---|
-| `make init dev` | Runs `terraform init` in environments/dev |
-| `make plan dev` | Runs `terraform plan` in environments/dev |
-| `make apply dev` | Runs `terraform apply` in environments/dev |
-| `make destroy dev` | Runs `terraform destroy` in environments/dev |
+| `make init dev` | terraform init in environments/dev |
+| `make plan dev` | terraform plan in environments/dev |
+| `make apply dev` | terraform apply in environments/dev |
+| `make destroy dev` | terraform destroy in environments/dev |
 
-Replace `dev` with `staging` or `prod` for other environments.
+Replace `dev` with `staging` or `prod` for those environments.
 
-**What this creates:** VPC, all 5 S3 buckets, KMS key, all IAM roles, RDS, DMS, Glue config, Redshift, MWAA, ECS cluster.
-
-### Step 3 — Deploy Glue Jobs
-
-```bash
-cd platform-glue-jobs
-# Coming soon — see platform-glue-jobs/README.md
-```
-
-### Step 4 — Deploy dbt Models
-
-```bash
-cd platform-dbt-analytics
-# Coming soon — see platform-dbt-analytics/README.md
-```
-
-### Step 5 — Deploy Airflow DAGs
-
-```bash
-cd platform-orchestration-mwaa-airflow
-# Coming soon — see platform-orchestration-mwaa-airflow/README.md
-```
-
-### Step 6 — Deploy AI Operations Agent
-
-```bash
-cd platform-ops-agent
-# Coming soon — see platform-ops-agent/README.md
-```
-
-**What this deploys:** An ECS Fargate task running the Python AI agent. It subscribes to all
-CloudWatch EventBridge rules created by the `orchestration` Terraform module and begins
-monitoring the pipeline immediately after deployment.
+Steps 9 through 13 have their own deployment instructions in each repository's README.
 
 ---
 
-## Key Concepts for Beginners
+## Concepts explained simply
 
 ### What is CDC (Change Data Capture)?
 
-CDC is a technique for tracking every change (insert, update, delete) made to a database table.
+CDC is a way of tracking every change that happens to a database without copying the whole thing each time.
 
-Instead of copying the entire table every time (expensive), CDC only captures what changed.
+PostgreSQL keeps an internal journal called the write-ahead log that records every insert, update, and delete before it is applied. AWS DMS reads this journal and converts those entries into files. This is much cheaper than dumping the whole database repeatedly and it captures changes in near real time.
 
-AWS DMS (Database Migration Service) connects to PostgreSQL and reads its Write-Ahead Log (WAL) — an internal PostgreSQL journal of every change — and converts those entries into files that land in S3.
+### What is a DAG?
 
-### What is a DAG (Directed Acyclic Graph)?
+A DAG is how Airflow represents a pipeline. DAG stands for Directed Acyclic Graph, which just means a set of tasks where each task depends on the ones before it, and there are no circular dependencies.
 
-A DAG is how Airflow represents a pipeline. It is a set of tasks where each task depends on the previous one completing successfully.
+My main pipeline DAG looks like this:
 
-Example DAG:
 ```
-start_glue_job → wait_for_glue → trigger_dbt → verify_gold → notify_success
+check_dms_health -> trigger_glue -> wait_for_glue -> trigger_dbt -> verify_gold -> notify_success
 ```
 
-Airflow executes each task in order and retries failed tasks automatically.
+Airflow runs each task in order, handles retries on failure, and lets me see the status of every run in a web UI.
 
-### What is Terraform State?
+### What is Terraform state?
 
-When Terraform creates resources (like an S3 bucket), it stores a record of what it created in a file called `terraform.tfstate`.
+When Terraform creates an S3 bucket, it writes a record of that to a file called `terraform.tfstate`. This file is how Terraform knows what already exists so it does not try to create the same bucket again next time.
 
-This file is critical — it is how Terraform knows what already exists so it does not create duplicates.
+I store this file in S3 (remote state) so it is shared across sessions and protected. A DynamoDB table prevents two Terraform runs from happening at the same time and corrupting the file.
 
-We store this file in S3 (remote state) so that the whole team shares the same view of infrastructure and concurrent applies are prevented by DynamoDB locking.
+### What is a Terraform module?
 
-### What is a Terraform Module?
-
-A module is a reusable block of Terraform code. Instead of copying the same S3 bucket configuration for dev, staging, and prod, we write it once in a module and call it three times with different inputs.
+A module is reusable Terraform code. Instead of writing the same S3 bucket configuration three times for dev, staging, and prod, I write it once in a module and call it three times with different inputs.
 
 ```hcl
 module "data_lake" {
   source      = "../../modules/data-lake"
-  environment = "dev"          # This is the only thing that changes
+  environment = "dev"
 }
 ```
 
 ### What is Parquet?
 
-Parquet is a column-oriented file format designed for analytical workloads.
+Parquet is a file format designed for analytics. Unlike a CSV which stores data row by row, Parquet stores data column by column.
 
-Instead of storing data row-by-row (like a CSV), Parquet stores data column-by-column. This means a query like `SELECT revenue FROM orders` only reads the `revenue` column, skipping all other columns. This is dramatically faster and cheaper for analytics.
+This matters because analytics queries typically read only a few columns from large tables. A query like `SELECT revenue FROM orders` only needs the revenue column. With Parquet, that query only reads the revenue column and skips everything else. This makes queries much faster and much cheaper on Athena, which charges per byte scanned.
 
-All data in this platform is stored as Parquet (compressed with Snappy or GZIP).
+All data in this platform is stored as Parquet, compressed with Snappy or GZIP.
 
-### What is an AI Agent?
+### What is an AI agent?
 
-An AI agent is a program that uses a large language model (LLM) to make decisions and take actions, not just answer questions.
+An AI agent is a program that uses a language model to make decisions, not just to generate text.
 
-In a standard program, the developer writes explicit if/else logic for every possible situation. An agent instead describes a situation to an LLM, asks what should be done, and then executes the response.
+In a normal program, I would write explicit if/else logic for every possible failure scenario. But the number of ways a five-hop data pipeline can fail is too large to cover exhaustively. New failure patterns appear that were never anticipated.
 
-This is useful for cross-service pipeline operations because the number of possible failure combinations across DMS, Glue, Athena, and Redshift is too large to write explicit rules for. The agent reasons about any failure pattern it encounters, even ones that were never anticipated when the code was written.
+An agent lets me describe a situation in natural language, have the model reason about it, and then execute whatever action the model recommends. This is useful for cross-service diagnosis because the model can reason about the relationship between a DMS lag event and a Glue failure in the same way a senior engineer would, without me having to write code for every possible combination.
 
 ---
 
-## Security Architecture
+## Security
 
-Every component in this platform follows the principle of **least privilege** — each service can only access exactly what it needs, nothing more.
+Every service in this platform follows least privilege, meaning each one can only access exactly what it needs and nothing more.
 
-| Security Control | Where Applied |
+| Control | Where it applies |
 |---|---|
 | KMS encryption at rest | All S3 buckets, RDS, DMS |
-| IAM roles (not users) | Glue, MWAA, Redshift, DMS, ECS each have dedicated roles |
-| VPC private subnets | All compute runs in private subnets with no internet access |
-| S3 public access blocked | All 5 data lake buckets block all public access |
-| S3 versioning enabled | All buckets retain previous versions for recovery |
+| Dedicated IAM roles | Glue, MWAA, Redshift, DMS, and ECS each have their own role |
+| Private subnets only | All compute runs with no direct internet access |
+| S3 public access blocked | All five data lake buckets |
+| S3 versioning enabled | All buckets keep previous file versions for recovery |
 | RDS deletion protection | Enabled in staging and prod |
-| Terraform prevent_destroy | State buckets protected from accidental deletion |
-| No static AWS access keys | All authentication uses temporary SSO credentials |
-| AI agent read-only by default | Agent can only write to Quarantine S3 and call Airflow REST API; cannot modify infrastructure |
+| Terraform prevent_destroy | State buckets cannot be accidentally deleted |
+| No static access keys | All authentication uses temporary SSO credentials |
+| AI agent scope limited | Can only write to Quarantine S3 and call the Airflow API |
 
 ---
 
-## Cost Considerations
+## Costs
 
-This platform uses serverless and pay-per-use services wherever possible:
+I keep costs low by destroying dev at the end of each session. The two most expensive always-on services are MWAA at about $0.49 per hour and RDS. When I am not actively working, those are gone.
 
-| Service | Cost Model |
+For local DAG development I run Airflow on my machine instead of in MWAA. I only spin MWAA up when I need to test it in the cloud or record a demo.
+
+A typical 3 to 4 hour dev session without MWAA costs under $0.50.
+
+Staging and prod are spun up occasionally to confirm deployments, then destroyed. Each validation run costs under $5.
+
+| Service | How it charges |
 |---|---|
-| Redshift Serverless | Pay per RPU-hour (scales to zero when idle) |
-| AWS Glue | Pay per DPU-hour (only when jobs run) |
-| Amazon Athena | Pay per TB of data scanned |
-| Amazon MWAA | Pay per environment-hour (always on when active) |
-| AWS DMS | Pay per replication instance-hour |
-| Amazon S3 | Pay per GB stored + requests |
-| ECS Fargate (AI agent) | Pay per vCPU-hour + memory-hour (very low — agent is lightweight) |
-| Claude API (AI agent) | Pay per token (only charges on actual incident analysis calls) |
-
-**For development:** Use `make destroy dev` after each session to avoid costs on RDS and MWAA (which are always-on services).
+| Redshift Serverless | Per RPU-hour, scales to zero when not in use |
+| AWS Glue | Per DPU-hour, only charged when jobs are running |
+| Athena | Per TB of data scanned |
+| MWAA | Per environment-hour while it is running |
+| DMS | Per replication instance-hour |
+| S3 | Per GB stored plus per request |
+| ECS Fargate (AI agent) | Per vCPU and memory-hour while running |
+| Claude API (AI agent) | Per token, only charged during incident analysis |
 
 ---
 
-## Naming Convention
+## Naming convention
 
-All resources follow this pattern:
-
-```
-{name_prefix}-{environment}-{account_id}-{resource_type}
-```
-
-Example S3 bucket: `edp-dev-123456789012-bronze`
-
-The account ID is included in bucket names because S3 bucket names are globally unique across all AWS accounts. Including the account ID prevents naming conflicts.
-
-IAM roles and other non-globally-unique resources follow:
+S3 bucket names include the AWS account ID because S3 names are globally unique across all accounts. Including the account ID prevents name collisions:
 
 ```
-{name_prefix}-{environment}-{role_name}
+edp-dev-123456789012-bronze
+edp-dev-123456789012-silver
+edp-dev-123456789012-gold
 ```
 
-Example: `edp-dev-glue-role`
+Everything else uses a shorter pattern:
+
+```
+edp-dev-glue-role
+edp-dev-dms-replication-instance
+```
+
+The pattern is always: prefix, environment, then the resource name.
 
 ---
 
-## What Is Built vs What Is Planned
+## Build status
 
 | Component | Status |
 |---|---|
-| Terraform remote state (bootstrap) | **Complete** |
-| VPC and networking | **Complete** |
-| S3 medallion data lake (all 5 buckets) | **Complete** |
-| KMS key, IAM roles, Glue Catalog | **In Progress** |
-| RDS PostgreSQL + DMS CDC pipeline | **In Progress** |
-| Glue security config + Athena workgroup | **In Progress** |
-| Redshift Serverless | **In Progress** |
-| MWAA (Airflow) environment | **In Progress** |
-| Glue PySpark jobs (Bronze → Silver) | **Planned** |
-| dbt models (Silver → Gold) | **Planned** |
-| Airflow DAGs | **Planned** |
-| AI Operations Agent (ECS Fargate + Claude) | **Planned** |
-| CDC Simulator | **Planned** |
+| Terraform remote state (bootstrap) | Done |
+| VPC and networking | Done |
+| S3 data lake (all 5 buckets) | Done |
+| KMS key, IAM roles, Glue Catalog | In progress |
+| RDS PostgreSQL and DMS CDC | In progress |
+| Glue config and Athena workgroup | In progress |
+| Redshift Serverless | Planned |
+| MWAA and ECS cluster | Planned |
+| Glue PySpark jobs (Bronze to Silver) | Planned |
+| dbt models (Silver to Gold) | Planned |
+| Airflow DAGs | Planned |
+| AI Operations Agent | Planned |
+| CDC Simulator | Planned |
 
 ---
 
-## Who Maintains This
+## Claude Code authentication reference
 
-This platform is maintained as an enterprise data engineering reference implementation.
+I use Claude Code as my AI coding assistant throughout this project. This section documents how the authentication works so I can pick up where I left off after a session ends or a limit is hit.
 
-All infrastructure is managed exclusively through Terraform. No resources are created manually in the AWS Console.
+### The two modes
 
-If you find something that was created manually, bring it under Terraform control using `terraform import`.
-
----
-
-## Claude Code — Authentication Reference
-
-This project is developed using Claude Code as the AI engineering assistant. This section documents how authentication works so you can resume work correctly after a session limit or restart.
-
----
-
-### The Two Authentication Modes
-
-Claude Code supports two distinct modes. Which one you are in determines your limits and how you are billed.
-
-| Mode | How it works | Session limits | Billing |
+| Mode | How it works | Limits | Billing |
 |---|---|---|---|
-| **Claude Pro** | Logged in with your Anthropic account | Yes — resets on a rolling window | Covered by subscription |
-| **API Key** | Authenticated with an API key | None | Pay per token |
+| Claude Pro | Logged in with Anthropic account | Yes, resets on a rolling window | Covered by subscription |
+| API Key | Authenticated with an API key | None | Pay per token |
 
-When working on intensive sessions (long Terraform plans, full repository audits, multi-file builds), the Pro session limit can be reached quickly. Switching to API key mode removes the session cap entirely.
+For intensive sessions with long Terraform plans and multi-file work, the Pro limit can be reached quickly. API key mode removes the cap entirely.
 
----
+### How to tell which mode I am in
 
-### How to Tell Which Mode You Are In
-
-Check the banner at the top of the Claude Code session:
+The banner at the top of the session shows it:
 
 ```
-Sonnet 4.6 · Claude Pro · your-email@...        ← Pro mode (subscription limits apply)
-Sonnet 4.6 · API Usage Billing                  ← API key mode (no session cap)
+Sonnet 4.6 · Claude Pro · your-email@...     <- Pro mode
+Sonnet 4.6 · API Usage Billing               <- API key mode
 ```
 
-Or run from your shell at any time:
+Or check from the terminal:
 
 ```bash
 claude auth status
 ```
 
----
-
-### Pro Mode — Normal Login
-
-When you launch Claude Code with a standard account login:
+### Switching to API key mode
 
 ```bash
-claude
-```
+# 1. Exit the current session (Ctrl+C or close terminal)
 
-Claude Code shows the Pro banner and consumes your subscription quota. When the session usage reaches 100%, Claude stops responding until the window resets.
-
-To log in with your account:
-
-```bash
-claude auth login
-```
-
----
-
-### Switching to API Key Mode
-
-Use this when you have hit the Pro session limit or want uninterrupted long sessions.
-
-**Step 1 — Exit the current session**
-
-Press `Ctrl+C` inside Claude, or close the terminal entirely if it is unresponsive.
-
-**Step 2 — Log out of Pro**
-
-```bash
+# 2. Log out of Pro
 claude auth logout
-```
 
-**Step 3 — Export your API key**
+# 3. Export the API key
+export ANTHROPIC_API_KEY="sk-ant-..."
 
-Generate a key from the Anthropic Console if you do not have one. Then export it into your shell:
-
-```bash
-export ANTHROPIC_API_KEY="sk-ant-xxxxxxxxxxxxxxxx"
-```
-
-To confirm the key is active in your shell:
-
-```bash
-echo $ANTHROPIC_API_KEY
-```
-
-**Step 4 — Launch Claude Code**
-
-```bash
+# 4. Launch Claude
 claude
-```
 
-**Step 5 — Log in inside the session**
-
-```bash
+# 5. Inside the session, log in
 /login
+# Select API key when prompted
 ```
 
-Select API key authentication when prompted. The banner will change to:
+The banner changes to `API Usage Billing` and there is no session cap.
 
-```
-Sonnet 4.6 · API Usage Billing
-```
-
-You are now in API mode. No session cap. Billing is per token until your API credit runs out.
-
----
-
-### Switching Back to Pro Mode
+### Switching back to Pro
 
 ```bash
-# Inside the Claude session
-/logout
-
-# Then from your shell
-claude auth logout
+/logout                # inside the session
+claude auth logout     # from the terminal
 claude auth login
 claude
 ```
 
-The banner will return to `Claude Pro · your-email@...`.
-
----
-
-### Making the API Key Permanent
-
-`export` only sets the variable for the current terminal session. If you open a new terminal it will be gone. To make it permanent, add it to your shell profile:
+### Making the API key permanent
 
 ```bash
-# For zsh (default on macOS)
-echo 'export ANTHROPIC_API_KEY="sk-ant-xxxxxxxxxxxxxxxx"' >> ~/.zshrc
+echo 'export ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
 source ~/.zshrc
 ```
 
----
+### API key rules
 
-### API Key Security Rules
-
-- **Never paste an API key into a chat, screenshot, or document.** If you do, revoke it immediately from the Anthropic Console and generate a new one.
-- **Never commit an API key to Git.** Add `.env` and any file containing `ANTHROPIC_API_KEY` to `.gitignore`.
-- **Revoke and rotate keys regularly.** Treat them like passwords.
-
-If a key is exposed:
-
-1. Go to the Anthropic Console → API Keys
-2. Revoke the exposed key immediately
-3. Generate a new key
-4. Export the new key in your shell
+Never paste an API key into a chat, commit it to Git, or include it in a screenshot. If one gets exposed, go to the Anthropic Console, revoke it immediately, and generate a new one.
 
 ---
 
-### Quick Reference
-
-```bash
-# Check current auth mode
-claude auth status
-
-# Start in Pro mode
-claude auth login && claude
-
-# Start in API key mode
-export ANTHROPIC_API_KEY="sk-ant-..."
-claude
-# then inside: /login → select API key
-
-# Switch modes mid-project
-/logout              # inside Claude session
-claude auth logout   # from shell
-```
-
----
-
-*Read each repository's own README.md for module-level details and step-by-step deployment instructions.*
+*Each repository has its own README with module-level details and step-by-step instructions specific to that component.*
