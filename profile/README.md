@@ -272,6 +272,159 @@ The agent is deliberately limited to operations and recovery. It does not modify
 
 ---
 
+## The source data model
+
+This is an important distinction that is easy to get wrong.
+
+The star schema (with a central fact table surrounded by dimension tables) is the **output** of the platform. It is what the Gold layer looks like after all the transformations are done. It is not what the source database looks like.
+
+The source system is an OLTP (Online Transaction Processing) database. OLTP databases are designed for fast writes from a live application. They are normalized, which means data is split into small, focused tables to avoid duplication and make writes fast. A real e-commerce backend writes to an OLTP database constantly throughout the day.
+
+The job of this platform is to read that normalized OLTP data, clean it up, and reshape it into the star schema format that analysts and dashboards need.
+
+### The OLTP source tables (what PostgreSQL contains)
+
+```
+customers
+  customer_id    VARCHAR  PRIMARY KEY
+  first_name     VARCHAR
+  last_name      VARCHAR
+  email          VARCHAR  UNIQUE
+  country        VARCHAR
+  phone          VARCHAR
+  signup_date    DATE
+  updated_at     TIMESTAMP
+
+products
+  product_id     VARCHAR  PRIMARY KEY
+  name           VARCHAR
+  category       VARCHAR
+  brand          VARCHAR
+  unit_price     DECIMAL(10,2)
+  stock_qty      INTEGER
+  updated_at     TIMESTAMP
+
+orders
+  order_id       VARCHAR  PRIMARY KEY
+  customer_id    VARCHAR  REFERENCES customers
+  order_date     DATE
+  order_status   VARCHAR  -- pending, confirmed, shipped, delivered, cancelled
+  updated_at     TIMESTAMP
+
+order_items
+  order_item_id  VARCHAR  PRIMARY KEY
+  order_id       VARCHAR  REFERENCES orders
+  product_id     VARCHAR  REFERENCES products
+  quantity       INTEGER
+  unit_price     DECIMAL(10,2)
+  line_total     DECIMAL(10,2)
+  updated_at     TIMESTAMP
+
+payments
+  payment_id     VARCHAR  PRIMARY KEY
+  order_id       VARCHAR  REFERENCES orders
+  method         VARCHAR  -- card, paypal, bank_transfer
+  amount         DECIMAL(10,2)
+  status         VARCHAR  -- pending, completed, failed, refunded
+  payment_date   TIMESTAMP
+  updated_at     TIMESTAMP
+
+shipments
+  shipment_id      VARCHAR  PRIMARY KEY
+  order_id         VARCHAR  REFERENCES orders
+  carrier          VARCHAR  -- DHL, FedEx, UPS
+  delivery_status  VARCHAR  -- processing, shipped, in_transit, delivered
+  shipped_date     TIMESTAMP
+  delivered_date   TIMESTAMP
+  updated_at       TIMESTAMP
+```
+
+Every table has an `updated_at` column. This is standard practice in production systems and makes CDC (Change Data Capture) more reliable because DMS can always see exactly when each row last changed.
+
+### What DMS captures from these tables
+
+DMS reads every INSERT, UPDATE, and DELETE from PostgreSQL's WAL (Write-Ahead Log) and writes one Bronze file per operation. A single order going from `pending` to `confirmed` to `shipped` produces three separate Bronze records for that order row.
+
+### How dbt builds the star schema from Silver
+
+The dbt Gold models JOIN the Silver tables together to produce the star schema. For example, the central fact table is built like this:
+
+```sql
+-- Gold: fact_order_items
+SELECT
+    oi.order_item_id,
+    oi.order_id,
+    o.customer_id,
+    oi.product_id,
+    p.payment_id,
+    s.shipment_id,
+    o.order_date,
+    o.order_status,
+    (oi.unit_price * oi.quantity) AS order_total,
+    oi.quantity,
+    oi.unit_price,
+    oi.line_total
+FROM silver.order_items oi
+JOIN silver.orders    o  ON oi.order_id = o.order_id
+JOIN silver.payments  p  ON o.order_id  = p.order_id
+JOIN silver.shipments s  ON o.order_id  = s.order_id
+```
+
+The dimension tables (customers, products, payments, shipments) are Silver tables with selected columns exposed as clean, deduplicated reference data.
+
+---
+
+## How data is stored in S3
+
+### File format: Parquet everywhere
+
+All data in this platform is stored as Parquet files. Parquet is a columnar file format, meaning data is organized by column rather than by row.
+
+This matters because analytics queries typically read only a few columns from large tables. A query asking for `order_total` and `order_date` only needs those two columns. Parquet reads just those columns from disk and skips everything else. A CSV (Comma-Separated Values) file forces the query engine to read every column even if only two are needed.
+
+Parquet also stores min and max statistics for each block of rows. Query engines use these to skip entire blocks that cannot possibly match the query's filters. This is called predicate pushdown.
+
+**Compression by layer:**
+
+- **Bronze:** Parquet with GZIP (GNU Zip) compression. Bronze is written once and rarely read directly. GZIP produces the smallest files, which minimizes S3 storage costs.
+- **Silver and Gold:** Parquet with Snappy compression. Snappy is faster to decompress than GZIP, which matters here because Glue and Athena read these files frequently.
+
+### Partitioning strategy
+
+Partitioning means organizing files into subfolders so query engines can skip entire folders when they are not needed.
+
+**Fact tables are partitioned by year and month:**
+
+Order items, payments, and shipments are event data that grows over time. Analysts almost always filter by date range. Hive-style partitioning (the `year=YYYY/month=MM/` naming format) tells Athena and Spark exactly which folders to read without scanning everything.
+
+```
+silver/
+  order_items/
+    year=2024/month=01/part-00000.parquet
+    year=2024/month=02/part-00000.parquet
+  payments/
+    year=2024/month=01/part-00000.parquet
+  shipments/
+    year=2024/month=01/part-00000.parquet
+```
+
+**Dimension tables are not partitioned:**
+
+Customers, products, and orders are reference data. They are small relative to fact tables and nobody queries them with a date filter. Partitioning them by date would create hundreds of tiny files, which is called the small files problem and actually makes queries slower. The Glue job writes these as a single file per table representing the full current state.
+
+```
+silver/
+  customers/part-00000.parquet
+  products/part-00000.parquet
+  orders/part-00000.parquet
+```
+
+**Dev vs prod partitioning:**
+
+In dev, I partition by `year/month` only. In prod with high data volumes, I partition by `year/month/day`. Partitioning too finely in dev creates many tiny files from the small test dataset, which Athena charges the 10 MB minimum per file for even when files are smaller than that.
+
+---
+
 ## The data lake layers (Medallion Architecture)
 
 The data lake follows a pattern called Medallion Architecture. Each layer is a separate S3 bucket and has a specific job.
@@ -550,11 +703,9 @@ module "data_lake" {
 
 ### What is Parquet?
 
-Parquet is a file format designed for analytics. Unlike a CSV (Comma-Separated Values file) which stores data row by row, Parquet stores data column by column.
+Parquet is a file format designed for analytics. Unlike a CSV (Comma-Separated Values file) which stores data row by row, Parquet stores data column by column. A query asking for `revenue` and `order_date` only reads those two columns from disk and skips everything else. This makes queries much faster and much cheaper on Athena, which charges per byte scanned.
 
-This matters because analytics queries typically read only a few columns from large tables. A query like `SELECT revenue FROM orders` only needs the revenue column. With Parquet, that query only reads the revenue column and skips everything else. This makes queries much faster and much cheaper on Athena, which charges per byte scanned.
-
-All data in this platform is stored as Parquet, compressed with Snappy or GZIP.
+All data in this platform is stored as Parquet. Bronze uses GZIP compression. Silver and Gold use Snappy compression. See the "How data is stored in S3" section above for the full partitioning strategy.
 
 ### What is an AI agent?
 
@@ -635,16 +786,16 @@ The pattern is always: prefix, environment, then the resource name. EDP stands f
 | Terraform remote state (bootstrap) | Done |
 | VPC and networking | Done |
 | S3 data lake (all 5 buckets) | Done |
-| KMS key, IAM roles, Glue Catalog | In progress |
-| RDS PostgreSQL and DMS CDC | In progress |
-| Glue config and Athena workgroup | In progress |
-| Redshift Serverless | Planned |
-| MWAA and ECS cluster | Planned |
+| KMS key, IAM roles, Glue Catalog | Done |
+| RDS PostgreSQL and DMS CDC | Done |
+| Glue config and Athena workgroup | Done |
+| Redshift Serverless | Done |
+| MWAA orchestration environment | Done |
+| CDC Simulator (source data generator) | Next |
 | Glue PySpark jobs (Bronze to Silver) | Planned |
 | dbt models (Silver to Gold) | Planned |
 | Airflow DAGs | Planned |
 | AI Operations Agent | Planned |
-| CDC Simulator | Planned |
 
 ---
 
