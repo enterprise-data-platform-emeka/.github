@@ -16,17 +16,17 @@ This README covers everything: what the platform does, how each piece works, and
 4. [The source data model](#the-source-data-model)
 5. [How data is stored in S3](#how-data-is-stored-in-s3)
 6. [The data lake layers](#the-data-lake-layers-medallion-architecture)
-7. [The AI Operations Agent](#the-ai-operations-agent)
-8. [Tools and technologies](#tools-and-technologies)
-9. [Repository layout](#repository-layout)
-10. [AWS accounts](#aws-accounts)
-11. [Network layout](#network-layout)
-12. [Terraform module map](#terraform-module-map)
-13. [Prerequisites](#prerequisites)
-14. [Build phases overview](#build-phases-overview)
-15. [Deploying and running the platform](#deploying-and-running-the-platform)
-16. [Tearing down](#tearing-down)
-17. [Runbook: regenerate Bronze data in AWS from scratch](#runbook-regenerate-bronze-data-in-aws-from-scratch)
+7. [Business questions this platform answers](#business-questions-this-platform-answers)
+8. [The AI Operations Agent](#the-ai-operations-agent)
+9. [Tools and technologies](#tools-and-technologies)
+10. [Repository layout](#repository-layout)
+11. [AWS accounts](#aws-accounts)
+12. [Network layout](#network-layout)
+13. [Terraform module map](#terraform-module-map)
+14. [Prerequisites](#prerequisites)
+15. [Build phases overview](#build-phases-overview)
+16. [Deploying and running the platform](#deploying-and-running-the-platform)
+17. [Running the simulator locally vs in AWS](#running-the-simulator-locally-vs-in-aws)
 18. [Concepts explained simply](#concepts-explained-simply)
 19. [Security](#security)
 20. [Costs](#costs)
@@ -47,9 +47,9 @@ This platform fixes that by doing the following:
 
 1. **Capturing every database change** in real time using a technique called CDC (Change Data Capture), so inserts, updates, and deletes are all tracked
 2. **Storing the raw captured data** into an immutable Bronze layer in S3 (Simple Storage Service, Amazon's cloud file storage), so the original data is never modified or lost
-3. **Cleaning and validating** the raw data with Apache Spark, turning it into structured records in a Silver layer
-4. **Sending any bad records** to a Quarantine area instead of silently dropping them, so data quality problems can be diagnosed
-5. **Aggregating the clean data** into business-level summaries in a Gold layer using SQL models written in dbt (data build tool)
+3. **Cleaning, validating, and modelling** the raw data with Apache Spark (PySpark), applying CDC operations correctly, and producing a star schema of fact and dimension tables in a Silver layer
+4. **Writing any records that fail validation** to a Quarantine area inside Silver instead of silently dropping them, so data quality problems are visible and fixable
+5. **Answering specific business questions** in a Gold layer by running SQL aggregation models written in dbt (data build tool), using Athena as the query engine against the Silver facts and dimensions
 6. **Making the Gold data available** through Redshift Serverless so BI (Business Intelligence) tools like Tableau, Power BI, or QuickSight can connect and build dashboards
 7. **Running the whole pipeline automatically** on a schedule using Apache Airflow
 8. **Logging everything** to CloudWatch so I can see what is happening at any point
@@ -123,14 +123,22 @@ Step 2:  AWS DMS reads that change from PostgreSQL's internal WAL (Write-Ahead L
 Step 3:  Airflow detects it is time to run the pipeline and triggers the Glue job.
 
 Step 4:  The Glue PySpark job reads Bronze.
-         Each record is validated:
-           - If valid, it is written to Silver.
-           - If invalid, it is written to Quarantine.
+         It reconciles all CDC operations into current state (so an order
+         that went through five status updates appears exactly once with
+         its latest status), validates each record, and models the data
+         into a star schema:
+           - Valid records are written to Silver as dim_customer,
+             dim_product, fact_orders, and fact_order_items.
+           - Records that fail validation are written to a Quarantine
+             area inside Silver so nothing is silently lost.
 
 Step 5:  Airflow detects the Glue job finished and triggers dbt.
 
-Step 6:  dbt runs SQL models using Athena as the query engine.
-         Silver data is aggregated into Gold summaries.
+Step 6:  dbt runs SQL aggregation models using Athena as the query engine.
+         It reads the Silver fact and dimension tables and produces four
+         Gold tables, each answering a specific business question:
+         daily revenue, product performance, customer behaviour, and
+         order fulfilment health.
 
 Step 7:  Redshift Serverless uses Spectrum to read Gold directly from S3.
          No data loading required — Spectrum queries S3 as if it were a Redshift table.
@@ -221,29 +229,56 @@ Every table has an `updated_at` column. This is standard practice in production 
 
 DMS reads every INSERT, UPDATE, and DELETE from PostgreSQL's WAL and writes one Bronze file per batch of operations. A single order going from `pending` to `confirmed` to `shipped` produces three separate Bronze records for that row.
 
-### How dbt builds the star schema from Silver
+### How Glue builds the star schema in Silver
 
-The dbt Gold models JOIN the Silver tables together to produce the star schema. For example, the central fact table is built like this:
+The six normalized OLTP tables from PostgreSQL get modelled into four Silver tables. Glue reconciles all CDC operations first (so each entity appears exactly once with its latest state), then reshapes the data.
+
+**Dimension tables** (one row per entity, current state):
+
+```
+dim_customer
+  customer_id, first_name, last_name, email, country, phone,
+  signup_date, updated_at
+
+dim_product
+  product_id, name, category, brand, unit_price, stock_qty,
+  updated_at
+```
+
+**Fact tables** (one row per event):
+
+```
+fact_orders
+  order_id, customer_id, order_date, order_status,
+  payment_method, payment_status, payment_amount,
+  carrier, delivery_status, shipped_date, delivered_date,
+  updated_at
+
+fact_order_items
+  order_item_id, order_id, customer_id, product_id,
+  quantity, unit_price, line_total,
+  order_date, order_status,
+  updated_at
+```
+
+`fact_orders` denormalizes the orders, payments, and shipments tables into a single row per order. `fact_order_items` is the grain-level fact, one row per line item, with the order context included so analysts don't need to JOIN back to `fact_orders` for common queries.
+
+### How dbt builds Gold from Silver
+
+dbt reads the Silver fact and dimension tables through Athena and runs pure aggregation SQL. No JOINs are needed at the Gold layer because Silver already did the modelling. For example:
 
 ```sql
--- Gold: fact_order_items
+-- Gold: agg_daily_revenue
 SELECT
-    oi.order_item_id,
-    oi.order_id,
-    o.customer_id,
-    oi.product_id,
-    p.payment_id,
-    s.shipment_id,
-    o.order_date,
-    o.order_status,
-    (oi.unit_price * oi.quantity) AS order_total,
-    oi.quantity,
-    oi.unit_price,
-    oi.line_total
-FROM silver.order_items oi
-JOIN silver.orders    o  ON oi.order_id = o.order_id
-JOIN silver.payments  p  ON o.order_id  = p.order_id
-JOIN silver.shipments s  ON o.order_id  = s.order_id
+    order_date,
+    COUNT(DISTINCT order_id)   AS order_count,
+    COUNT(DISTINCT customer_id) AS unique_customers,
+    SUM(payment_amount)         AS total_revenue,
+    AVG(payment_amount)         AS avg_order_value
+FROM silver.fact_orders
+WHERE payment_status = 'completed'
+GROUP BY order_date
+ORDER BY order_date
 ```
 
 ---
@@ -305,21 +340,134 @@ DMS writes two types of files to Bronze:
 - `LOAD00000001.parquet` — the full snapshot of all existing rows at task start
 - `YYYY/MM/DD/YYYYMMDD-*.parquet` — ongoing CDC change files, one batch per minute
 
-### Silver: clean and structured
+### Silver: star schema
 
-This is the output of the Glue PySpark job. It reads Bronze, validates each record, applies CDC operations correctly so the current state of each record is accurate, and writes the result here. Records that fail validation go to Quarantine instead. Silver represents the current real state of the source database.
+This is the output of the Glue PySpark jobs. Glue reads Bronze, reconciles all CDC operations into current state (resolving every insert, update, and delete into a single accurate row per entity), validates each record, and models the data into a star schema of four tables: `dim_customer`, `dim_product`, `fact_orders`, and `fact_order_items`.
 
-### Gold: business-ready aggregations
+Silver is the layer dbt reads from. It contains no raw CDC rows, no intermediate states, and no duplicates. It's the clean, modelled, business-ready version of the source data.
 
-This is what analysts actually query. dbt reads Silver through Athena and runs SQL models that produce things like daily revenue by product, monthly active users, and weekly order volumes. Gold is pre-aggregated so dashboards load fast.
+Records that fail validation during Silver processing are written to a Quarantine area (described below) instead of being silently dropped.
 
-### Quarantine: the bad records
+### Gold: business answers
 
-Any record that fails Silver validation ends up here instead of being silently dropped. Silent data loss is much worse than visible data quality problems. With Quarantine I can go back, see exactly what failed, and fix the problem at the source.
+This is what analysts actually query. dbt reads the Silver fact and dimension tables through Athena and runs four pure aggregation models, each producing a pre-computed answer to a specific business question. Gold tables are compact and fast — dashboards query them without scanning large fact tables.
+
+The four Gold tables and what they answer are described in the next section.
+
+### Quarantine: Silver validation failures
+
+Any record that fails validation during Silver processing ends up here instead of being silently dropped. Silent data loss is much worse than a visible quality problem. With Quarantine I can see exactly which records failed, why they failed, and fix the problem at the source. The Quarantine area lives alongside the Silver tables so it's clear these are Silver's rejected outputs, not something separate.
 
 ### Athena results
 
 Athena writes query result files here whenever it runs a SQL query. This is the designated output location for the Athena workgroup.
+
+---
+
+## Business questions this platform answers
+
+The Gold layer exists to answer four specific business questions. These are the questions I designed the pipeline to support, and everything in Silver is modelled to make them fast and straightforward to compute.
+
+---
+
+### Question 1: How is revenue performing day by day?
+
+**Gold table:** `agg_daily_revenue`
+
+E-commerce businesses live and die by daily revenue trends. This table gives a complete picture of each day's performance — total revenue, number of orders, number of unique customers who ordered, and average order value. Comparing today to yesterday or last week is a single filter on this table.
+
+```sql
+-- dbt model: agg_daily_revenue
+SELECT
+    order_date,
+    COUNT(DISTINCT order_id)    AS order_count,
+    COUNT(DISTINCT customer_id) AS unique_customers,
+    SUM(payment_amount)         AS total_revenue,
+    AVG(payment_amount)         AS avg_order_value
+FROM silver.fact_orders
+WHERE payment_status = 'completed'
+GROUP BY order_date
+ORDER BY order_date
+```
+
+---
+
+### Question 2: Which products and categories drive the most revenue?
+
+**Gold table:** `agg_product_performance`
+
+Not all products are equal. This table ranks products and categories by revenue, units sold, and number of orders. It makes it easy to see which products are worth promoting, which categories are growing, and which slow movers might need attention.
+
+```sql
+-- dbt model: agg_product_performance
+SELECT
+    p.product_id,
+    p.name           AS product_name,
+    p.category,
+    p.brand,
+    SUM(fi.quantity)    AS units_sold,
+    SUM(fi.line_total)  AS total_revenue,
+    COUNT(DISTINCT fi.order_id) AS order_count,
+    AVG(fi.unit_price)  AS avg_selling_price
+FROM silver.fact_order_items fi
+JOIN silver.dim_product p ON fi.product_id = p.product_id
+GROUP BY p.product_id, p.name, p.category, p.brand
+ORDER BY total_revenue DESC
+```
+
+---
+
+### Question 3: How are customers behaving — are they coming back?
+
+**Gold table:** `agg_customer_behaviour`
+
+Acquiring a new customer costs more than retaining an existing one. This table shows each customer's total spend, number of orders, average order value, and how recently they ordered. It identifies high-value customers, first-time buyers, and customers who haven't ordered in a while.
+
+```sql
+-- dbt model: agg_customer_behaviour
+SELECT
+    c.customer_id,
+    c.first_name,
+    c.last_name,
+    c.country,
+    COUNT(DISTINCT o.order_id)  AS total_orders,
+    SUM(o.payment_amount)       AS lifetime_revenue,
+    AVG(o.payment_amount)       AS avg_order_value,
+    MIN(o.order_date)           AS first_order_date,
+    MAX(o.order_date)           AS last_order_date
+FROM silver.fact_orders o
+JOIN silver.dim_customer c ON o.customer_id = c.customer_id
+WHERE o.payment_status = 'completed'
+GROUP BY c.customer_id, c.first_name, c.last_name, c.country
+ORDER BY lifetime_revenue DESC
+```
+
+---
+
+### Question 4: How healthy is order fulfilment?
+
+**Gold table:** `agg_fulfilment_health`
+
+Customers expect fast, reliable delivery. This table tracks fulfilment performance by carrier: how many orders each carrier handled, what percentage were delivered, and the average number of days between shipping and delivery. It highlights which carriers are reliable and where delays are happening.
+
+```sql
+-- dbt model: agg_fulfilment_health
+SELECT
+    carrier,
+    COUNT(DISTINCT order_id)                                AS total_orders,
+    SUM(CASE WHEN delivery_status = 'delivered' THEN 1 ELSE 0 END) AS delivered_orders,
+    ROUND(
+        100.0 * SUM(CASE WHEN delivery_status = 'delivered' THEN 1 ELSE 0 END)
+        / COUNT(DISTINCT order_id), 1
+    )                                                       AS delivery_rate_pct,
+    AVG(
+        DATEDIFF('day', CAST(shipped_date AS DATE), CAST(delivered_date AS DATE))
+    )                                                       AS avg_delivery_days
+FROM silver.fact_orders
+WHERE shipped_date IS NOT NULL
+GROUP BY carrier
+ORDER BY total_orders DESC
+```
 
 ---
 
@@ -586,9 +734,9 @@ When I first looked at everything this platform needs, it felt like too much to 
 
 ### Phase 2: Application code (Steps 9 to 13)
 
-**Step 9 — PySpark transformation jobs** (`platform-glue-jobs`): Reads Bronze, validates records, applies CDC operations correctly, writes Silver or Quarantine.
+**Step 9 — PySpark transformation jobs** (`platform-glue-jobs`): Reads Bronze, reconciles CDC operations into current state, validates records, and models the data into a Silver star schema: `dim_customer`, `dim_product`, `fact_orders`, `fact_order_items`. Validation failures go to Quarantine inside Silver.
 
-**Step 10 — SQL transformation models** (`platform-dbt-analytics`): dbt models that read Silver through Athena and produce Gold business aggregations.
+**Step 10 — SQL aggregation models** (`platform-dbt-analytics`): dbt reads the Silver fact and dimension tables through Athena and produces four Gold aggregation tables answering the four business questions: daily revenue, product performance, customer behaviour, and fulfilment health.
 
 **Step 11 — Airflow DAGs** (`platform-orchestration-mwaa-airflow`): DAGs (Directed Acyclic Graphs) that orchestrate the full sequence: ingest check, Glue, dbt, Redshift load.
 
@@ -606,9 +754,57 @@ When I first looked at everything this platform needs, it felt like too much to 
 
 ## Deploying and running the platform
 
-This section has the exact commands in sequential order. Follow them in the order listed.
+This section explains every step in the order you run them, including what each step does and why it's needed. It covers a fresh deploy, loading data into the Bronze S3 (Simple Storage Service) bucket, and the safe teardown at the end.
 
-### Step 1: Set up remote state (run once per account)
+You need four terminals. Open them before starting.
+
+- **Terminal 1** — all setup commands and AWS CLI commands
+- **Terminal 2** — SSM (Systems Manager) tunnel (must stay open the whole session)
+- **Terminal 3** — CDC (Change Data Capture) simulator (runs continuously)
+- **Terminal 4** — optional psql session for checking RDS data directly
+
+If this is a re-run after a previous teardown, the ingestion module and bastion EC2 are commented out in the Terraform config. Jump to [Re-enabling ingestion after a teardown](#re-enabling-ingestion-after-a-teardown) at the bottom of this section first, then come back to Step 1.
+
+---
+
+### Step 1: Log in to AWS SSO
+
+AWS SSO (Single Sign-On) is how I authenticate with AWS. Instead of a permanent access key (which is a security risk if leaked), SSO issues short-lived temporary credentials that expire automatically. The `dev-admin` profile is configured in `~/.aws/config` and points to the dev AWS account.
+
+In Terminal 1:
+
+```bash
+aws sso login --profile dev-admin
+```
+
+If the session is already active this returns immediately. If it opens a browser, approve the login. Every AWS CLI command in this guide needs `--profile dev-admin` appended so it uses these credentials.
+
+---
+
+### Step 2: Set passwords
+
+The platform needs two passwords: one for the RDS PostgreSQL database and one for Redshift Serverless. Hardcoding passwords in Terraform files is a security risk — if the file is committed to Git, the password is exposed. Instead, Terraform reads them from environment variables at runtime.
+
+The `TF_VAR_` prefix is Terraform's convention for environment variable injection. `TF_VAR_db_password` maps to `var.db_password` in Terraform automatically.
+
+In Terminal 1:
+
+```bash
+export TF_VAR_db_password="YourSecurePassword123!"
+export TF_VAR_redshift_admin_password="AnotherSecurePassword456!"
+```
+
+Use the same values each time. After `make apply`, Terraform stores both passwords in SSM Parameter Store as encrypted secrets. The CDC simulator and future pipeline tools fetch them from SSM at runtime — they never touch these files.
+
+---
+
+### Step 3: Set up remote state (run once per AWS account, ever)
+
+Terraform needs to track what it has created in AWS. It does this in a file called `terraform.tfstate`. By default that file lives on your laptop, which means if you switch machines or two people work on the same project, they have conflicting state.
+
+Remote state solves this by storing `terraform.tfstate` in an S3 bucket instead of locally. A DynamoDB (Amazon's NoSQL database) table handles locking — if two Terraform runs start at the same time, one of them waits rather than both writing conflicting state.
+
+This step creates that S3 bucket and DynamoDB table. It only needs to run once, ever, per AWS account. If the bucket already exists, skip this step.
 
 ```bash
 cd terraform-bootstrap/environments/dev
@@ -616,60 +812,103 @@ terraform init
 terraform apply
 ```
 
-### Step 2: Initialise the main infrastructure
+---
+
+### Step 4: Init the main infrastructure
+
+`terraform init` does two things: it downloads the provider plugins Terraform needs (in this case the AWS provider), and it connects to the remote state backend (the S3 bucket from Step 3) so subsequent commands read and write state from there.
+
+In Terminal 1:
 
 ```bash
 cd terraform-platform-infra-live
 make init dev
 ```
 
-This downloads all provider plugins and configures the S3 remote state backend. Remote state means Terraform stores what it created in S3 rather than locally, so state is shared and safe.
+You should see "Terraform has been successfully initialized" at the end.
 
-### Step 3: Plan
+---
+
+### Step 5: Plan
+
+Before Terraform creates anything, `terraform plan` shows you exactly what it intends to do. It compares what's in the Terraform code with what already exists in AWS (using the remote state), then outputs a list of resources it will create, modify, or destroy. Nothing is touched during a plan — it's read-only.
 
 ```bash
-export TF_VAR_db_password="YourSecurePassword123!"
-export TF_VAR_redshift_admin_password="AnotherSecurePassword456!"
 make plan dev
 ```
 
-Terraform shows you exactly what it will create before touching anything. You should see roughly 83 resources to add and 0 to destroy. Review the output before continuing.
+You should see roughly 83 resources to add and 0 to destroy. Read through it to confirm nothing looks unexpected before continuing.
 
-### Step 4: Apply
+---
+
+### Step 6: Apply
+
+`terraform apply` creates everything defined in the Terraform modules. Here's what gets built and why each piece exists:
+
+- **VPC (Virtual Private Cloud)** — an isolated private network inside AWS. Nothing outside can reach resources in this VPC unless I explicitly allow it.
+- **Subnets** — segments of the VPC. RDS and DMS live in private subnets (no internet access). The bastion EC2 lives in a public subnet so SSM can reach it.
+- **S3 buckets** — five buckets for Bronze, Silver, Gold, Quarantine, and Athena results. All encrypted, all versioned.
+- **KMS (Key Management Service) key** — one encryption key used across all services. If the key is deleted or access is revoked, the data becomes unreadable.
+- **IAM (Identity and Access Management) roles** — each service gets its own role with only the permissions it needs. Glue can read S3 but not touch RDS. DMS can write to S3 but not query Redshift. This is least-privilege access.
+- **RDS PostgreSQL** — the source database that simulates a live application database. DMS reads from this.
+- **DMS replication instance and task** — the engine that watches RDS for changes and copies them to S3 Bronze as Parquet files.
+- **Bastion EC2** — a small virtual machine in the public subnet used purely as a relay. Your Mac connects to it via SSM, and it forwards the connection to RDS.
+- **Glue config and Athena workgroup** — configuration containers for Phase 2. No jobs run yet, but the settings (encryption, VPC connection) are ready.
+- **Redshift Serverless** — the analytical query engine for Phase 3. Empty for now but ready.
 
 ```bash
 make apply dev
 ```
 
-Creates everything: VPC, S3 buckets, IAM roles, RDS, DMS, bastion EC2, Redshift, Glue catalog. Takes about 10 to 15 minutes. The DMS replication instance alone takes 5 to 7 minutes.
+Takes 10 to 15 minutes. The DMS replication instance alone takes 5 to 7 minutes to provision. When it finishes, check the outputs:
 
-After apply completes, note the bastion instance ID and RDS endpoint from the Terraform output. You need both in the next steps.
+```bash
+cd environments/dev
+terraform output
+```
 
-### Step 5: Reboot RDS to activate logical replication
+Note the `bastion_instance_id`, `rds_endpoint`, and `ssm_tunnel_command` values. You need them in the steps below.
 
-RDS needs a reboot after the first apply because the parameter group sets `rds.logical_replication = 1` with `apply_method = pending-reboot`. DMS cannot read the WAL until logical replication is active.
+---
+
+### Step 7: Reboot RDS to activate logical replication
+
+This step is specific to how PostgreSQL CDC works. DMS reads database changes from PostgreSQL's WAL (Write-Ahead Log) — an internal journal that records every insert, update, and delete. To use the WAL for CDC, PostgreSQL needs `logical_replication` enabled.
+
+The Terraform code sets this in the RDS parameter group with `apply_method = pending-reboot`. That means the setting is queued but won't take effect until the database restarts. Without the reboot, DMS can connect to RDS but won't capture any changes.
+
+In Terminal 1:
 
 ```bash
 aws rds reboot-db-instance \
   --db-instance-identifier edp-dev-source-db \
   --profile dev-admin --region eu-central-1
 
-# Wait for the reboot to complete (about 2 minutes)
+# This command waits silently until RDS is accepting connections again (~2 minutes)
 aws rds wait db-instance-available \
   --db-instance-identifier edp-dev-source-db \
   --profile dev-admin --region eu-central-1
+
+echo "RDS is ready"
 ```
 
-### Step 6: Open the SSM tunnel (keep this terminal open)
+---
 
-The SSM (Systems Manager) tunnel is how your Mac talks to RDS. RDS is in a private subnet with no internet access. The tunnel routes local port 5433 through SSM to the bastion EC2, and from there to RDS port 5432.
+### Step 8: Open the SSM tunnel (Terminal 2 — keep open)
+
+RDS is in a private subnet with no internet access. There's no public IP, no open port 5432, no way to connect to it directly from your Mac. This is intentional — a database exposed to the internet is a security risk.
+
+The SSM tunnel is the secure solution. Here's exactly what it does:
+
+1. Your Mac connects to the bastion EC2 over HTTPS using the AWS SSM service (no SSH keys needed, no firewall ports to open)
+2. You tell it to forward `localhost:5433` on your Mac to `<rds-endpoint>:5432` via the bastion
+3. From that point on, any connection to `localhost:5433` on your Mac silently travels: `Mac → HTTPS → SSM → bastion → RDS`
+
+The bastion never stores data. It's just a relay inside the VPC that can reach RDS because they're in the same network.
+
+Copy the `ssm_tunnel_command` from the Terraform output and run it in Terminal 2:
 
 ```bash
-# Get outputs from Terraform
-cd terraform-platform-infra-live/environments/dev
-terraform output
-
-# Open the tunnel (replace with your actual output values)
 aws ssm start-session \
   --target <bastion_instance_id> \
   --document-name AWS-StartPortForwardingSessionToRemoteHost \
@@ -677,52 +916,83 @@ aws ssm start-session \
   --profile dev-admin --region eu-central-1
 ```
 
-You'll see `Port 5433 forwarded` when it's ready. Do not close this terminal — closing it drops the tunnel and the simulator will lose its database connection.
+Wait for `Port 5433 forwarded` to appear. **Do not close Terminal 2** — the tunnel is a live process and closing it immediately drops the connection to RDS.
 
-### Step 7: Set up the CDC simulator
+If you see `TargetNotConnected`, the SSM agent on the bastion is still starting up. Wait 2 to 3 minutes and retry. You can check whether it has registered with AWS:
 
-In a new terminal:
+```bash
+aws ssm describe-instance-information \
+  --query 'InstanceInformationList[*].{ID:InstanceId,Status:PingStatus}' \
+  --output table --profile dev-admin --region eu-central-1
+```
+
+The instance must show `Online` before the tunnel will open.
+
+---
+
+### Step 9: Set up the CDC simulator
+
+The CDC simulator is the Python application in `platform-cdc-simulator`. It pretends to be a real e-commerce application by writing customers, products, orders, payments, and shipments to the RDS database. This gives DMS something realistic to capture.
+
+`make setup` creates an isolated Python virtual environment and installs the dependencies listed in `requirements.txt`. This only needs to run once per machine.
+
+In Terminal 1:
 
 ```bash
 cd platform-cdc-simulator
-
-# Create .env file pointing at RDS via the tunnel
-cat > .env << 'EOF'
-DB_HOST=localhost
-DB_PORT=5433
-DB_NAME=ecommerce
-DB_USER=postgres
-DB_PASSWORD=YourSecurePassword123!
-ENVIRONMENT=dev
-EOF
-
 make setup
 ```
 
-### Step 8: Create schema and seed data
+---
+
+### Step 10: Create the schema
+
+The RDS database was created empty by Terraform. Before any data can be inserted, the tables need to exist. `make schema` runs the DDL (Data Definition Language) SQL that creates the six tables: customers, products, orders, order_items, payments, and shipments.
+
+It also sets `REPLICA IDENTITY FULL` on each table, which tells PostgreSQL to include the full row (not just the primary key) in the WAL log for updates and deletes. DMS needs this to correctly capture what changed.
 
 ```bash
-# Create all tables in RDS
 make schema ENV=dev
+```
 
-# Seed historical data
-# Note: each INSERT round-trips through SSM (~50ms per query)
-# Use SEED_HISTORICAL_ORDERS=200 for dev to keep seeding under 2 minutes
+The `ENV=dev` flag tells the Makefile to fetch the RDS password from SSM Parameter Store instead of a local `.env` file. No `.env` editing needed for AWS mode.
+
+---
+
+### Step 11: Seed historical data
+
+`make seed` populates the tables with realistic starting data: 500 customers, 200 products, and 2000 historical orders with their associated payments and shipments. This represents data that already existed before the CDC pipeline started — the kind of data a real application would have built up over months.
+
+```bash
 SEED_HISTORICAL_ORDERS=200 make seed ENV=dev
 ```
 
-### Step 9: Start the live simulator
+`SEED_HISTORICAL_ORDERS=200` overrides the default count of 2000. Each INSERT travels: `Mac → SSM → bastion → RDS`, which adds about 50ms per query. 200 orders takes roughly 1 to 2 minutes. 2000 orders takes over 15 minutes — not worth it in dev.
+
+Wait for the seeder to finish printing before moving on.
+
+---
+
+### Step 12: Run the live simulator (Terminal 3 — keep running)
+
+`make seed` was a one-time bulk insert of historical data. `make simulate` is different — it runs a continuous loop that generates ongoing activity: new orders arrive, existing orders progress through statuses (pending → confirmed → shipped → delivered), payments are processed, shipments are created.
+
+This is what makes the CDC pipeline interesting. DMS doesn't just copy a static snapshot — it captures a live stream of changes as they happen.
+
+In Terminal 3:
 
 ```bash
-# Generates new orders continuously in a loop — leave running
+cd platform-cdc-simulator
 make simulate ENV=dev
 ```
 
-The simulator generates new orders, updates statuses, creates payments and shipments. Each loop produces a small burst of activity then sleeps briefly. This feeds a live stream of changes to RDS for DMS to capture.
+Leave this running. DMS will pick up these changes every ~60 seconds and write new Parquet files to Bronze S3. To stop it later, press `Ctrl+C`.
 
-### Step 10: Verify data in RDS (optional)
+---
 
-In a separate terminal, connect directly to RDS via the tunnel to confirm the simulator is writing data:
+### Step 13: Verify RDS data (Terminal 4, optional)
+
+If you want to confirm the data is actually in RDS before waiting for DMS, connect directly via the tunnel:
 
 ```bash
 psql -h localhost -p 5433 -U postgres -d ecommerce
@@ -737,407 +1007,208 @@ SELECT COUNT(*) FROM order_items;
 \q
 ```
 
-### Step 11: Test DMS endpoint connections
+You should see hundreds of rows and a mix of order statuses. If the simulator is running, the counts increase each time you check.
 
-Before starting the DMS task, verify DMS can reach both RDS (source) and S3 (target). Connection tests must pass before the task will start.
+---
 
-```bash
-# Get endpoint and replication instance ARNs
-aws dms describe-endpoints \
-  --query 'Endpoints[*].{ID:EndpointIdentifier,ARN:EndpointArn,Status:Status}' \
-  --output table --profile dev-admin --region eu-central-1
+### Step 14: Start the DMS replication task
 
-aws dms describe-replication-instances \
-  --query 'ReplicationInstances[*].{ID:ReplicationInstanceIdentifier,ARN:ReplicationInstanceArn}' \
-  --output table --profile dev-admin --region eu-central-1
+The DMS task was created by Terraform but it doesn't start automatically. Starting it triggers a two-phase process:
 
-# Test source (RDS) connection
-aws dms test-connection \
-  --replication-instance-arn <replication_instance_arn> \
-  --endpoint-arn <source_endpoint_arn> \
-  --profile dev-admin --region eu-central-1
+1. **Full load** — DMS reads every existing row from all six tables and writes them as Parquet files to Bronze S3. One `LOAD00000001.parquet` file per table. This is the historical snapshot.
+2. **CDC mode** — once the full load is done, DMS switches to watching the WAL in real time and writing new Parquet files every ~60 seconds as changes come in. These are the date-stamped files.
 
-# Test target (S3) connection
-aws dms test-connection \
-  --replication-instance-arn <replication_instance_arn> \
-  --endpoint-arn <target_s3_endpoint_arn> \
-  --profile dev-admin --region eu-central-1
+**Important:** DMS remembers whether it has run before. The `start-replication-task-type` flag tells it what to do:
 
-# Wait for both to show "successful"
-aws dms describe-connections \
-  --query 'Connections[*].{Endpoint:EndpointIdentifier,Status:Status,Error:LastFailureMessage}' \
-  --output table --profile dev-admin --region eu-central-1
-```
+- `start-replication` — use this the very first time only
+- `reload-target` — use this on any subsequent run (fresh full load, discards previous state)
+- `resume-processing` — use this if the task was interrupted mid-run and you want it to continue from where it stopped
 
-### Step 12: Start the DMS replication task
+Get the task ARN and start it:
 
 ```bash
-# Get the task ARN
-aws dms describe-replication-tasks \
+TASK_ARN=$(aws dms describe-replication-tasks \
   --filters Name=replication-task-id,Values=edp-dev-cdc-task \
   --query 'ReplicationTasks[0].ReplicationTaskArn' \
-  --output text --profile dev-admin --region eu-central-1
+  --output text --profile dev-admin --region eu-central-1)
 
-# Start the task
+# First time ever:
 aws dms start-replication-task \
-  --replication-task-arn <task_arn> \
+  --replication-task-arn $TASK_ARN \
   --start-replication-task-type start-replication \
   --profile dev-admin --region eu-central-1
-```
 
-### Step 13: Monitor DMS and verify S3
-
-```bash
-# Check task status and full-load progress
-aws dms describe-replication-tasks \
-  --filters Name=replication-task-id,Values=edp-dev-cdc-task \
-  --query 'ReplicationTasks[0].{Status:Status,PercentComplete:ReplicationTaskStats.FullLoadProgressPercent,TablesLoaded:ReplicationTaskStats.TablesLoaded}' \
-  --output table --profile dev-admin --region eu-central-1
-```
-
-Status progression: `starting` → `full-load` → `running` (CDC mode). `PercentComplete = 100` and `TablesLoaded = 6` means full load is done and CDC is active.
-
-```bash
-# Verify Parquet files in Bronze S3
-aws s3 ls s3://edp-dev-<account-id>-bronze/raw/ --recursive \
-  --profile dev-admin --region eu-central-1
-```
-
-You'll see two types of files per table:
-- `raw/public/<table>/LOAD00000001.parquet` — full-load snapshot of all rows
-- `raw/public/<table>/YYYY/MM/DD/YYYYMMDD-*.parquet` — CDC change batches, one file per minute
-
-Six tables will have files: customers, order_items, orders, payments, products, shipments.
-
-Phase 1 complete. The Bronze S3 bucket has real CDC data and the pipeline source is confirmed working.
-
----
-
-## Tearing down
-
-Run this after Phase 1 testing. It destroys all billable resources (RDS, DMS, bastion EC2, Redshift, VPC, IAM roles) while preserving the Bronze S3 data for Phase 2.
-
-```bash
-make destroy dev
-```
-
-The Bronze S3 bucket has `force_destroy = false`, so Terraform's destroy will fail to delete it (the bucket is non-empty). Everything else is destroyed successfully. You'll see this error at the end — it is intentional and expected:
-
-```
-Error: deleting S3 Bucket (edp-dev-158311564771-bronze): BucketNotEmpty
-```
-
-The Bronze data stays in S3 untouched. The Glue jobs in Phase 2 read directly from it without needing to re-run the simulator.
-
-The ingestion module (RDS + DMS) and the bastion EC2 are already commented out in `environments/dev/main.tf` after the Phase 1 run, so they won't be recreated on the next apply.
-
----
-
-## Runbook: regenerate Bronze data in AWS from scratch
-
-Use this chapter whenever the Bronze S3 bucket is empty and you need to refill it.
-It is self-contained — all commands are here, in order, with no cross-references to other sections.
-
-You'll need four terminals. Open them all before starting.
-
-- **Terminal 1** — runs all setup commands and AWS CLI commands
-- **Terminal 2** — holds the SSM tunnel open (must stay open the whole time)
-- **Terminal 3** — runs the CDC simulator
-- **Terminal 4** — optional psql session for checking RDS data
-
----
-
-### Part 1: Uncomment the ingestion infrastructure
-
-The ingestion module (RDS + DMS) and the bastion EC2 are commented out in the Terraform config after each run. Uncomment them before applying.
-
-Open each file and uncomment the relevant blocks:
-
-**`terraform-platform-infra-live/environments/dev/main.tf`**
-- Uncomment the `module "ingestion"` block
-- Uncomment everything from the bastion comment header down to and including `aws_security_group_rule.rds_ingress_bastion`
-
-**`terraform-platform-infra-live/environments/dev/variables.tf`**
-- Uncomment all five ingestion variables: `db_password`, `db_instance_class`, `dms_instance_class`, `multi_az`, `deletion_protection`
-
-**`terraform-platform-infra-live/environments/dev/outputs.tf`**
-- Uncomment all four outputs: `rds_endpoint`, `bastion_instance_id`, `ssm_tunnel_command`, `simulator_env_block`
-
----
-
-### Part 2: Deploy the infrastructure
-
-In Terminal 1:
-
-```bash
-cd terraform-platform-infra-live
-
-# Set passwords — use the same values as before
-export TF_VAR_db_password="YourSecurePassword123!"
-export TF_VAR_redshift_admin_password="AnotherSecurePassword456!"
-
-# Log in to AWS SSO first if your session has expired
-aws sso login --profile dev-admin
-
-make init dev
-make plan dev
-make apply dev
-```
-
-Apply takes about 10 to 15 minutes. When it finishes, note the outputs — you need the bastion instance ID and RDS endpoint for the tunnel command.
-
-```bash
-# Check the outputs
-cd environments/dev
-terraform output
-```
-
----
-
-### Part 3: Reboot RDS to activate logical replication
-
-RDS must be rebooted once after every fresh apply. The parameter group sets
-`rds.logical_replication = 1` with `apply_method = pending-reboot`, which means
-the setting only takes effect after a reboot. DMS cannot capture CDC changes until
-this is active.
-
-In Terminal 1:
-
-```bash
-aws rds reboot-db-instance \
-  --db-instance-identifier edp-dev-source-db \
-  --profile dev-admin --region eu-central-1
-
-# Wait until the instance is available again (~2 minutes)
-aws rds wait db-instance-available \
-  --db-instance-identifier edp-dev-source-db \
-  --profile dev-admin --region eu-central-1
-
-echo "RDS is ready"
-```
-
----
-
-### Part 4: Open the SSM tunnel
-
-In Terminal 2 (keep this open for the entire session):
-
-```bash
-# Replace <bastion_instance_id> and <rds_endpoint> with your terraform output values
-aws ssm start-session \
-  --target <bastion_instance_id> \
-  --document-name AWS-StartPortForwardingSessionToRemoteHost \
-  --parameters 'host=<rds_endpoint>,portNumber=5432,localPortNumber=5433' \
-  --profile dev-admin --region eu-central-1
-```
-
-Wait for `Port 5433 forwarded` to appear. Do not close Terminal 2 — closing it drops
-the tunnel and the simulator loses its database connection.
-
-If you see `TargetNotConnected`, the SSM agent on the bastion is still starting up.
-Wait 2 to 3 minutes and retry. Check registration with:
-
-```bash
-aws ssm describe-instance-information \
-  --query 'InstanceInformationList[*].{ID:InstanceId,Status:PingStatus}' \
-  --output table --profile dev-admin --region eu-central-1
-```
-
-The instance must show `Online` before the tunnel will work.
-
----
-
-### Part 5: Set up the CDC simulator
-
-In Terminal 1:
-
-```bash
-cd platform-cdc-simulator
-
-# Create the .env file pointing at RDS via the tunnel
-cat > .env << 'EOF'
-DB_HOST=localhost
-DB_PORT=5433
-DB_NAME=ecommerce
-DB_USER=postgres
-DB_PASSWORD=YourSecurePassword123!
-ENVIRONMENT=dev
-EOF
-
-# Install Python dependencies
-make setup
-```
-
----
-
-### Part 6: Create the schema and seed data
-
-In Terminal 1:
-
-```bash
-# Create all tables in RDS
-make schema ENV=dev
-
-# Seed historical data
-# SEED_HISTORICAL_ORDERS=200 keeps it fast over the SSM tunnel (~1-2 minutes)
-# Each INSERT round-trips through SSM (~50ms), so large counts take a long time
-SEED_HISTORICAL_ORDERS=200 make seed ENV=dev
-```
-
-You should see the seeder printing progress. When it finishes, move to the next step.
-
----
-
-### Part 7: Start the live simulator
-
-In Terminal 3:
-
-```bash
-cd platform-cdc-simulator
-make simulate ENV=dev
-```
-
-The simulator runs in a loop, inserting new orders, updating order statuses, creating
-payments and shipments. Leave it running — DMS will capture these changes as they happen.
-
-To check what's in RDS from Terminal 4 (optional):
-
-```bash
-psql -h localhost -p 5433 -U postgres -d ecommerce
-```
-
-```sql
-SELECT status, COUNT(*) FROM orders GROUP BY status ORDER BY COUNT(*) DESC;
-SELECT COUNT(*) FROM customers;
-SELECT COUNT(*) FROM order_items;
-\q
-```
-
----
-
-### Part 8: Test DMS endpoint connections
-
-Both DMS endpoint connections must pass before starting the replication task.
-
-In Terminal 1:
-
-```bash
-# Get the replication instance ARN
-aws dms describe-replication-instances \
-  --query 'ReplicationInstances[0].ReplicationInstanceArn' \
-  --output text --profile dev-admin --region eu-central-1
-
-# Get both endpoint ARNs
-aws dms describe-endpoints \
-  --query 'Endpoints[*].{ID:EndpointIdentifier,ARN:EndpointArn}' \
-  --output table --profile dev-admin --region eu-central-1
-
-# Test the source endpoint (RDS)
-aws dms test-connection \
-  --replication-instance-arn <replication_instance_arn> \
-  --endpoint-arn <source_endpoint_arn> \
-  --profile dev-admin --region eu-central-1
-
-# Test the target endpoint (S3)
-aws dms test-connection \
-  --replication-instance-arn <replication_instance_arn> \
-  --endpoint-arn <target_s3_endpoint_arn> \
-  --profile dev-admin --region eu-central-1
-
-# Poll until both show "successful" (run this a few times, takes ~30 seconds each)
-aws dms describe-connections \
-  --query 'Connections[*].{Endpoint:EndpointIdentifier,Status:Status,Error:LastFailureMessage}' \
-  --output table --profile dev-admin --region eu-central-1
-```
-
-Both must show `successful` before continuing. If the source fails with an SSL or
-`pg_hba.conf` error, check that `ssl_mode = "require"` is set in
-`modules/ingestion/main.tf` on the `aws_dms_endpoint` resource.
-
----
-
-### Part 9: Start the DMS replication task
-
-In Terminal 1:
-
-```bash
-# Get the task ARN
-aws dms describe-replication-tasks \
-  --filters Name=replication-task-id,Values=edp-dev-cdc-task \
-  --query 'ReplicationTasks[0].ReplicationTaskArn' \
-  --output text --profile dev-admin --region eu-central-1
-
-# Start the task
+# Any time after that (re-runs after a destroy and re-apply):
 aws dms start-replication-task \
-  --replication-task-arn <task_arn> \
-  --start-replication-task-type start-replication \
+  --replication-task-arn $TASK_ARN \
+  --start-replication-task-type reload-target \
   --profile dev-admin --region eu-central-1
 ```
 
+If you're not sure which to use, try `start-replication`. If AWS returns an error saying it's only valid for tasks running for the first time, use `reload-target` instead.
+
 ---
 
-### Part 10: Monitor progress and verify S3
+### Step 15: Monitor DMS and verify Bronze S3
 
-In Terminal 1:
+Poll this command every 30 seconds or so until the status changes:
 
 ```bash
-# Check task status — wait for Status=running and PercentComplete=100
 aws dms describe-replication-tasks \
   --filters Name=replication-task-id,Values=edp-dev-cdc-task \
   --query 'ReplicationTasks[0].{Status:Status,PercentComplete:ReplicationTaskStats.FullLoadProgressPercent,TablesLoaded:ReplicationTaskStats.TablesLoaded,TablesErrored:ReplicationTaskStats.TablesErrored}' \
   --output table --profile dev-admin --region eu-central-1
 ```
 
-Status progression: `starting` → `full-load` → `running`. Once `PercentComplete = 100`
-and `TablesLoaded = 6`, the full load is done and DMS is in live CDC mode.
+Status moves through: `starting` → `full-load` → `running`. You want `PercentComplete = 100`, `TablesLoaded = 6`, and `TablesErrored = 0`. Once status is `running`, DMS is in live CDC mode and will write new files every minute as the simulator runs.
+
+Then confirm the files are actually in S3:
 
 ```bash
-# Verify Parquet files are in the Bronze bucket
+# Replace <account-id> with your AWS account ID (visible in the Terraform outputs)
 aws s3 ls s3://edp-dev-<account-id>-bronze/raw/ --recursive \
   --profile dev-admin --region eu-central-1
 ```
 
-You should see two types of files per table:
+You'll see two types of files per table, and this is the important distinction:
 
 ```
-raw/public/orders/LOAD00000001.parquet          <- full load snapshot
-raw/public/orders/2026/03/10/20260310-*.parquet <- live CDC batches (~1 per minute)
+raw/public/orders/LOAD00000001.parquet           <- the full load snapshot (all rows at start time)
+raw/public/orders/2026/03/11/20260311-*.parquet  <- live CDC batches (~1 file per minute)
 ```
 
-Six tables will have files: customers, order_items, orders, payments, products, shipments.
-The Bronze bucket now has real data. The data lake is ready for Glue processing.
+The `LOAD` file is a point-in-time snapshot. The date-stamped files are the ongoing changes. The Glue PySpark jobs in Phase 2 need to handle both correctly — applying INSERTs, UPDATEs, and DELETEs from the CDC files on top of the snapshot.
+
+Six tables will have files: customers, order_items, orders, payments, products, shipments. When they all appear, Phase 1 is complete.
 
 ---
 
-### Part 11: Tear down safely
+### Step 16: Tear down
 
-This is the critical part. The S3 bucket protection only works if you run `terraform apply`
-**before** `terraform destroy` to sync the `force_destroy = false` flag into the Terraform
-state. Skipping the apply means state still has `force_destroy = true` and destroy will
-wipe the bucket.
+I don't leave AWS resources running between sessions. RDS costs ~$0.02/hr and DMS costs ~$0.10/hr, so even an overnight session adds unnecessary cost. Tearing down means destroying all the compute resources while keeping the Bronze S3 data intact for Phase 2.
 
-Stop the simulator in Terminal 3 first (`Ctrl+C`), then close the SSM tunnel in Terminal 2 (`Ctrl+C`).
+Stop the simulator in Terminal 3 (`Ctrl+C`), then close the tunnel in Terminal 2 (`Ctrl+C`).
 
 In Terminal 1:
 
 ```bash
 cd terraform-platform-infra-live
-
-# Step 1: apply FIRST to sync force_destroy=false into state
-# This does not recreate anything — it only updates the flag on the S3 buckets
-make apply dev
-
-# Step 2: now destroy safely
 make destroy dev
 ```
 
-Destroy will fail on the non-empty Bronze bucket with `BucketNotEmpty`. That is the
-expected and correct behaviour — it means the data is protected. All other resources
-(RDS, DMS, bastion EC2, Redshift, VPC, IAM roles) will be destroyed cleanly.
+Terraform destroys everything: RDS, DMS replication instance, bastion EC2, Redshift, VPC, subnets, IAM roles, Glue config, and Athena workgroup. The Bronze S3 bucket has `force_destroy = false` set in the Terraform code, which means Terraform refuses to delete a non-empty bucket. Destroy will fail on that bucket at the very end with:
 
-After destroy completes, comment the ingestion module and bastion back out in
-`environments/dev/main.tf`, `variables.tf`, and `outputs.tf` so they are not
-recreated on the next apply.
+```
+Error: deleting S3 Bucket (edp-dev-158311564771-bronze): BucketNotEmpty
+```
+
+This is intentional and correct. Your CDC data is safe. Everything else is gone and you're no longer being charged.
+
+---
+
+### Re-enabling ingestion after a teardown
+
+After each teardown, comment out the ingestion module and bastion in these three files. This prevents Terraform from recreating those expensive resources next time you run `make apply` without intending to (for example, when deploying just the Glue jobs in Phase 2).
+
+**`environments/dev/main.tf`** — comment out:
+- The entire `module "ingestion" { ... }` block
+- Everything from the bastion comment header down to and including `aws_security_group_rule.rds_ingress_bastion`
+
+**`environments/dev/variables.tf`** — comment out:
+- The five ingestion variables: `db_password`, `db_instance_class`, `dms_instance_class`, `multi_az`, `deletion_protection`
+
+**`environments/dev/outputs.tf`** — comment out:
+- The four outputs: `rds_endpoint`, `bastion_instance_id`, `ssm_tunnel_command`, `simulator_env_block`
+
+When you need to re-run the full ingestion (to regenerate Bronze data), uncomment all of the above and go back to Step 1.
+
+---
+
+## Running the simulator locally vs in AWS
+
+The CDC simulator in `platform-cdc-simulator` can run against two different databases: a local PostgreSQL container on your Mac, or the RDS PostgreSQL instance in AWS. The simulator code is identical in both cases — only the connection details change. The Makefile handles the switch automatically based on whether you pass `ENV=dev` or not.
+
+Here's when to use each mode and what the difference actually means for the data pipeline.
+
+---
+
+### Local Docker mode
+
+Use this when you want to develop and test the simulator itself, run unit or integration tests, or just experiment with the schema and data without spending money on AWS.
+
+The data you generate stays in a local PostgreSQL container on your Mac. DMS is not involved. Nothing goes to S3. This mode is purely for working on the simulator code.
+
+```bash
+cd platform-cdc-simulator
+
+# Start a local PostgreSQL container on port 5432
+make docker-up
+
+# Create the schema (tables, triggers, replica identity)
+make schema
+
+# Seed historical data (customers, products, historical orders)
+make seed
+
+# Run the live simulator in a continuous loop
+make simulate
+```
+
+No `ENV=` flag means the Makefile reads connection details from the `.env` file, which points at `localhost:5432` (the Docker container). The default password is `localpass`.
+
+To stop:
+
+```bash
+# Stop the simulator: Ctrl+C in the terminal running make simulate
+
+# Stop and remove the Docker container (data is preserved in a Docker volume)
+make docker-down
+
+# To also wipe the data and start fresh next time:
+docker volume rm platform-cdc-simulator_postgres_data
+```
+
+---
+
+### AWS cloud mode
+
+Use this when you want real CDC data flowing into S3 Bronze — the actual pipeline input that the Glue PySpark jobs will read in Phase 2.
+
+The data you generate goes into RDS. DMS watches RDS and copies it to S3 Bronze as Parquet files. This is what the rest of the pipeline depends on. You need the full AWS infrastructure deployed (Steps 1 to 6 in the deployment section) and the SSM tunnel open (Step 8) before running these commands.
+
+```bash
+cd platform-cdc-simulator
+
+# Create the schema in RDS
+make schema ENV=dev
+
+# Seed historical data into RDS
+make seed ENV=dev
+
+# Run the live simulator against RDS
+make simulate ENV=dev
+```
+
+The `ENV=dev` flag tells the Makefile to fetch the RDS password from SSM Parameter Store instead of the `.env` file, and to connect via `localhost:5433` (the SSM tunnel) instead of `localhost:5432` (Docker).
+
+---
+
+### What actually changes between the two modes
+
+Nothing in the simulator code changes. The same Python files run in both modes. The only difference is where the database lives:
+
+| | Local Docker | AWS Cloud |
+|---|---|---|
+| Database | PostgreSQL in Docker on your Mac | RDS PostgreSQL in a private VPC subnet |
+| Port | `localhost:5432` | `localhost:5433` (via SSM tunnel) |
+| Password source | `.env` file (`localpass`) | SSM Parameter Store |
+| Data destination | Local Docker volume | S3 Bronze bucket via DMS |
+| Cost | Free | ~$0.12/hr (RDS + DMS) |
+| DMS involved | No | Yes |
+| Needs tunnel | No | Yes |
+| Makefile flag | None | `ENV=dev` |
+
+The local mode is for developing and testing the simulator. The AWS mode is for feeding the actual data pipeline.
 
 ---
 
