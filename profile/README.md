@@ -1,8 +1,8 @@
 # Enterprise Data Platform (EDP)
 
-I built this project to learn and demonstrate production-grade data engineering on AWS (Amazon Web Services). The idea is to take raw data from a database, move it through a series of cleaning and transformation steps, and make it available to business analysts through a dashboard — the same way it works inside real companies.
+I built this platform as a full production-grade data engineering implementation on AWS (Amazon Web Services). It takes raw data from a database, moves it through a series of cleaning and transformation steps, and makes it available to business analysts through a dashboard, the same way it works inside real companies.
 
-This is not a simplified demo. I wanted to build the actual thing that data engineers build at work, which means it uses Terraform (an infrastructure-as-code tool) for infrastructure, multiple AWS services, distributed data processing with Spark, SQL transformations with dbt (data build tool), orchestration with Airflow, and an AI agent to monitor and recover the pipeline when things go wrong.
+This is not a simplified demo. It covers the actual stack that data engineers use at work: Terraform (an infrastructure-as-code tool) for infrastructure, multiple AWS services, distributed data processing with Spark, SQL transformations with dbt (data build tool), orchestration with Airflow, and an AI agent to monitor and recover the pipeline when things go wrong.
 
 This README covers everything: what the platform does, how each piece works, and the exact commands to deploy and run it in sequence from scratch.
 
@@ -27,13 +27,16 @@ This README covers everything: what the platform does, how each piece works, and
 15. [Build phases overview](#build-phases-overview)
 16. [Deploying and running the platform](#deploying-and-running-the-platform)
 17. [Running the simulator locally vs in AWS](#running-the-simulator-locally-vs-in-aws)
-18. [Concepts explained simply](#concepts-explained-simply)
-19. [Security](#security)
-20. [Costs](#costs)
-21. [Naming convention](#naming-convention)
-22. [Troubleshooting reference](#troubleshooting-reference)
-23. [Build status](#build-status)
-24. [Claude Code authentication reference](#claude-code-authentication-reference)
+18. [The Glue PySpark jobs](#the-glue-pyspark-jobs)
+19. [The dbt analytics layer](#the-dbt-analytics-layer)
+20. [Concepts explained simply](#concepts-explained-simply)
+21. [Security](#security)
+22. [Costs](#costs)
+23. [Naming convention](#naming-convention)
+24. [Troubleshooting reference](#troubleshooting-reference)
+25. [CI/CD pipelines](#cicd-pipelines)
+26. [Build status](#build-status)
+27. [Claude Code authentication reference](#claude-code-authentication-reference)
 
 ---
 
@@ -284,6 +287,8 @@ ORDER BY order_date
 ---
 
 ## How data is stored in S3
+
+![S3 data lake buckets](images/AWS-S3-Buckets.png)
 
 ### File format: Parquet everywhere
 
@@ -636,6 +641,8 @@ Each environment gets its own IP address range so they never overlap. CIDR (Clas
 
 All compute (RDS, DMS, Glue, Redshift, MWAA) runs in private subnets with no direct internet access. The only public-subnet resource is the bastion EC2 instance used as an SSM tunnel relay, and it has no open inbound ports.
 
+![VPC subnets and route tables](images/VPC-Subnets-RoutTable.png)
+
 ---
 
 ## Terraform module map
@@ -664,6 +671,8 @@ networking
               ├── serving
               └── orchestration
 ```
+
+![IAM roles created by Terraform](images/IAM-Roles.png)
 
 ---
 
@@ -718,7 +727,7 @@ When I first looked at everything this platform needs, it felt like too much to 
 
 **Step 1 — Remote state storage:** Before Terraform can work reliably, it needs a place to store `terraform.tfstate`. I store this in an S3 bucket with a DynamoDB (Amazon's NoSQL key-value database) table handling the locking. This runs once per AWS account before anything else, from `terraform-bootstrap`.
 
-**Step 2 — Networking:** Creates the VPC (Virtual Private Cloud), subnets, route tables, and an S3 VPC Endpoint so services inside the VPC talk to S3 without touching the public internet. Also creates SSM (Systems Manager) Interface Endpoints so the bastion EC2 can register with SSM without internet access. Nothing else can exist without a network.
+**Step 2 — Networking:** Creates the VPC (Virtual Private Cloud), subnets, route tables, and an S3 Gateway Endpoint so services inside the VPC talk to S3 without touching the public internet. The SSM (Systems Manager) Interface Endpoints that allow the bastion EC2 to register without internet access are defined in the networking module but kept commented out — they only need to be active when the bastion is running, because Interface Endpoints charge per AZ per hour even when nothing is using them. Nothing else can exist without a network.
 
 **Step 3 — Data lake storage:** Creates five S3 buckets: Bronze, Silver, Gold, Quarantine, and Athena results. Empty at this point, but they must exist before any service that writes to them can be configured.
 
@@ -779,6 +788,8 @@ aws sso login --profile dev-admin
 
 If the session is already active this returns immediately. If it opens a browser, approve the login. Every AWS CLI command in this guide needs `--profile dev-admin` appended so it uses these credentials.
 
+![AWS Access Portal](images/AWS-Access-Portal.png)
+
 ---
 
 ### Step 2: Set passwords
@@ -811,6 +822,8 @@ cd terraform-bootstrap/environments/dev
 terraform init
 terraform apply
 ```
+
+![DynamoDB remote state lock table](images/aws-dynamo-db.png)
 
 ---
 
@@ -1212,6 +1225,783 @@ The local mode is for developing and testing the simulator. The AWS mode is for 
 
 ---
 
+## The Glue PySpark jobs
+
+### What this phase does
+
+Bronze is raw and immutable. DMS (Database Migration Service) writes every insert, update, and delete from PostgreSQL as separate Parquet files in the Bronze S3 (Simple Storage Service) bucket, and nothing in Bronze ever changes. That's intentional: Bronze is an audit log, not a working dataset.
+
+Silver is what analysts actually build on. This phase reads the Bronze Parquet files, reconciles the CDC (Change Data Capture) operations to find the current state of each record, validates every row against data quality rules, and writes a clean star schema back to S3. The output is six tables: two dimensions and four facts. They contain no CDC metadata, no duplicate rows, and no invalid data.
+
+Rows that fail validation don't get silently dropped. They go to a dedicated Quarantine bucket with a column that names every rule they failed, so data quality problems are visible and fixable rather than buried.
+
+![Glue ETL jobs](images/glue-etl-jobs.png)
+
+---
+
+### Why PySpark and AWS Glue
+
+Apache Spark is a distributed processing engine. It breaks a large dataset into partitions, processes each partition in parallel across a cluster of machines, and combines the results. The same code runs on one machine with a small dataset or on a thousand machines with petabytes — you don't rewrite anything.
+
+PySpark (Python API for Apache Spark) is the Python interface to Spark. You write Python, but the execution engine underneath is the JVM (Java Virtual Machine)-based Spark runtime. This means you get Python's readability and ecosystem while Spark handles the distributed execution.
+
+AWS Glue is a managed Spark service. You give it a Python script, tell it how many workers to use, and it starts a Spark cluster, runs your job, and shuts the cluster down. There is no cluster to provision, no SSH keys, no capacity planning. The cluster is ephemeral: it exists for the duration of one job run and then disappears.
+
+The reason this combination works well for this platform is that the same code runs locally in Docker and in AWS without any changes. The only thing that differs between environments is the file paths: `file://` locally, `s3://` in AWS. Everything else, the CDC reconciliation, the validation, the schema definitions, is identical.
+
+---
+
+### The repository layout
+
+```
+platform-glue-jobs/
+├── Makefile                    # Developer task runner: setup, run, test, deploy
+├── docker-compose.yml          # AWS Glue 4.0 container for local job execution
+├── requirements.txt            # Runtime deps: pyspark, pyarrow (for generate_bronze.py)
+├── requirements-dev.txt        # Dev deps: pytest, ruff, mypy, faker, pandas
+│
+├── jobs/                       # One script per Silver table — these are the Glue jobs
+│   ├── dim_customer.py         # Customers dimension: reconcile + validate + write Silver
+│   ├── dim_product.py          # Products dimension: reconcile + validate + write Silver
+│   ├── fact_orders.py          # Orders fact: reconcile + partition by order_year/month
+│   ├── fact_order_items.py     # Order line items: join to orders for date, broadcast join
+│   ├── fact_payments.py        # Payments fact: reconcile + partition by payment_year/month
+│   └── fact_shipments.py       # Shipments fact: derives delivery_days, partition by shipped
+│
+├── lib/                        # Shared utilities imported by every job
+│   ├── schemas.py              # Explicit Spark schemas for all 6 Bronze tables
+│   ├── cdc.py                  # reconcile(): window function to find latest row per PK
+│   ├── validation.py           # validate(): rules engine, writes quarantine, returns clean df
+│   ├── paths.py                # Paths dataclass: resolves bronze_table/silver_table paths
+│   └── job_utils.py            # init_job/commit_job: graceful no-ops in local Docker
+│
+└── scripts/
+    └── generate_bronze.py      # Generates 6 test Parquet files that mirror real DMS output
+```
+
+---
+
+### How a Glue job works: the anatomy of one job
+
+Every job follows the same pattern. Here it is walked through using `dim_customer.py`.
+
+**1. getResolvedOptions**
+
+The first thing every job does is read its command-line arguments. `getResolvedOptions` is an AWS Glue utility that reads from `sys.argv` and returns a plain Python dict. The four arguments are: `JOB_NAME` (the Glue job name, used for registration), `BRONZE_PATH` (root path of the Bronze bucket), `SILVER_PATH` (root path of the Silver bucket), and `QUARANTINE_PATH` (root path of the Quarantine bucket).
+
+This is what makes the code environment-agnostic. The paths come in from outside. The job itself never has a hardcoded S3 bucket name or file path anywhere.
+
+**2. SparkContext and GlueContext**
+
+```python
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+```
+
+`SparkContext` starts the Spark engine. `GlueContext` wraps it with AWS Glue-specific features. `spark_session` is the entry point for all DataFrame operations. `Job` is the Glue job handle used in the next step.
+
+**3. init_job and commit_job**
+
+```python
+init_job(job, args["JOB_NAME"], args)
+# ... all the work happens here ...
+commit_job(job)
+```
+
+In AWS, `job.init()` registers the run with the Glue service so it appears in the console with a start time, status, and metrics. `job.commit()` saves the job bookmark and marks the run as complete.
+
+Locally in Docker, the Glue service endpoint doesn't exist. These calls would fail with a connection error and kill the job before it did any work. The `init_job` and `commit_job` helpers in `lib/job_utils.py` catch that exception and print a warning instead, so the Spark transformations run normally either way.
+
+**4. spark.read.schema().parquet()**
+
+```python
+bronze_df = spark.read.schema(CUSTOMERS_SCHEMA).parquet(paths.bronze_table("customers"))
+```
+
+This reads all Parquet files under the `customers/` directory in Bronze. Passing an explicit schema via `.schema()` is important for two reasons. First, it's faster: without a schema, Spark does a full scan of every file just to figure out the column types before doing any actual work. Second, it's safer: the schema in `lib/schemas.py` is the source of truth for what DMS actually writes, including the precise types (`int32` for PostgreSQL INTEGER, `decimal128(10,2)` for NUMERIC, `string` for `_dms_timestamp`).
+
+**5. reconcile()**
+
+```python
+current_df = reconcile(bronze_df, pk_col="customer_id")
+```
+
+This is where the CDC history is collapsed into current state. More detail in the next section.
+
+**6. select()**
+
+```python
+dim_df = current_df.select(
+    "customer_id", "first_name", "last_name", "email", "country", "phone", "signup_date",
+)
+```
+
+This chooses the Silver columns and discards everything else. For `dim_customer`, `updated_at` is dropped here. It's a technical audit column from PostgreSQL that tells the source system when the row was last modified. That information is already captured at the Bronze layer by `_dms_timestamp`. The Silver dimension table is about the business attributes of a customer, not internal change tracking.
+
+**7. validate()**
+
+```python
+clean_df = validate(dim_df, RULES, paths.quarantine_root, "dim_customer")
+```
+
+This applies data quality rules, writes invalid rows to Quarantine, and returns only the clean rows.
+
+**8. write.mode("overwrite").parquet()**
+
+```python
+clean_df.write.mode("overwrite").parquet(silver_path)
+```
+
+Overwrite mode replaces the previous run's output. Each job does full CDC reconciliation on every run, so the output is always a complete current snapshot. There is no concept of incrementally appending to Silver.
+
+---
+
+### CDC reconciliation: how we find the current state of each record
+
+When DMS copies a table it writes two kinds of files. The first is a full-load file called `LOAD00000001.parquet`. This is a snapshot of the entire table at the moment the DMS task started. Every row has `Op='I'` because the DMS endpoint is configured with `include_op_for_full_load=true`.
+
+After the full load, DMS writes ongoing CDC files as rows change in PostgreSQL. These are date-partitioned files under `raw/public/<table>/YYYY/MM/DD/`. Each file is a mix of `Op='I'` (new rows), `Op='U'` (updated rows), and `Op='D'` (deleted rows).
+
+The problem is straightforward: if a customer updates their email address three times, you have four rows for the same `customer_id` in Bronze: the original `I` from the full load, and three `U` rows from the CDC files. Without reconciliation you'd have four versions of that customer. The Silver dimension table needs exactly one row per customer, reflecting the current state.
+
+CDC reconciliation solves this with a window function. Here is the full `reconcile()` function from `lib/cdc.py`:
+
+```python
+def reconcile(df: DataFrame, pk_col: str) -> DataFrame:
+    window = Window.partitionBy(pk_col).orderBy(F.col("_dms_timestamp").desc())
+
+    current = (
+        df
+        .withColumn("_row_num", F.row_number().over(window))
+        .filter(F.col("_row_num") == 1)
+        .drop("_row_num")
+        .filter(F.col("Op") != "D")
+        .drop("Op", "_dms_timestamp")
+    )
+
+    return current
+```
+
+The window partitions all rows by primary key and orders them by `_dms_timestamp` descending, so the most recent event gets `row_number=1`. Filtering to `_row_num == 1` keeps only the latest event for each primary key. Then any row where the latest operation was `'D'` is discarded: those records were deleted in PostgreSQL and should not appear in Silver. Finally, the CDC metadata columns `Op` and `_dms_timestamp` are dropped because downstream Silver tables don't need them.
+
+The result is identical to what you'd get from `SELECT * FROM customers` on the live PostgreSQL at the time the most recent CDC file was written.
+
+---
+
+### Data validation and the Quarantine layer
+
+After CDC reconciliation, every job runs its DataFrame through `validate()` before writing to Silver. The function takes a dict of named rules. Each rule is a Spark SQL boolean expression, the same syntax you'd use in a `WHERE` clause. A row passes if the expression evaluates to true.
+
+The function adds one boolean check column per rule, then splits the DataFrame:
+
+- Rows where all checks pass are returned as the clean DataFrame. The caller writes these to Silver.
+- Rows where any check fails are written to the Quarantine bucket with an extra `_validation_errors` column that names every rule the row failed, then discarded from the return value.
+
+Why this matters: without validation, a null `customer_id` or a negative price would flow into Silver and then into Gold aggregations. A `SUM(amount)` that includes nulls returns null. A revenue figure that includes negative prices is wrong. The pipeline would produce incorrect answers silently. The Quarantine layer makes the problem visible: a data engineer can inspect it, find the root cause in the source system, and re-run the job once the source is fixed.
+
+The performance design is deliberate. `validate()` calls `annotated.cache()` once after adding the check columns. Writing the invalid rows to Quarantine is the first action that materialises the cache. When the caller writes the clean rows to Silver, Spark reuses the cached data instead of re-reading Bronze and re-running the CDC window function from scratch. Without the cache, every write action would independently trigger the full plan, meaning Bronze would be scanned twice and the window function computed twice. The cache eliminates that.
+
+---
+
+### The six Silver tables
+
+**dim_customer**
+
+Reads the Bronze `customers` table, reconciles CDC to get the current state of every customer, and writes a flat dimension table. The `updated_at` column is dropped because it's a technical audit timestamp from PostgreSQL. The business columns (name, email, country, phone, signup date) are what matter in the dimension.
+
+**dim_product**
+
+Reads the Bronze `products` table and writes a product dimension. The interesting design decision here is `stock_qty`: this column changes constantly as orders arrive and inventory is updated. CDC reconciliation ensures the Silver table always reflects the current stock level, not the level at the time of the initial full load. This makes Silver the correct source for "how many units do we have right now" queries.
+
+**fact_orders**
+
+Reads the Bronze `orders` table and writes the orders fact table, partitioned by `order_year` and `order_month`. Partitioning lets dbt and Athena scan only the months they need. A query for "revenue this month" reads one partition directory instead of the entire table. The partition columns are integers, which sort and compare correctly in Hive-style partition filtering.
+
+**fact_order_items**
+
+Reads Bronze `order_items` and also reads Bronze `orders` to get `order_date`. The `order_items` table doesn't have its own date, so the job joins to orders to derive the partition columns. The join uses `F.broadcast(current_orders_df)`: `current_orders_df` is small (one row per order, no history) so broadcasting it to every executor avoids a shuffle of the larger `order_items` side. Glue 4.0 has Adaptive Query Execution which may do this automatically, but an explicit broadcast hint makes the intent clear regardless of AQE thresholds.
+
+Orphaned items are also handled here. When an order is deleted in PostgreSQL, DMS writes `Op='D'` for that `order_id`. CDC reconciliation removes it from `current_orders_df`. Any `order_item` that references a deleted order then gets `order_date=null` from the left join, which means `order_year=null` and `order_month=null`. A Parquet file partitioned with null values lands in `__HIVE_DEFAULT_PARTITION__`, which is invisible to Athena partition filtering and unqueryable by dbt. The validation rules `order_year_not_null` and `order_month_not_null` catch these rows and send them to Quarantine.
+
+**fact_payments**
+
+Reads Bronze `payments` and writes a payments fact partitioned by `payment_year` and `payment_month`. The `amount` column is the primary driver of all revenue aggregations in the Gold layer. Payment status transitions (`pending` to `completed` or `failed`) are handled correctly by CDC reconciliation, which always keeps the most recent status.
+
+**fact_shipments**
+
+Reads Bronze `shipments` and writes a shipments fact partitioned by `shipped_year` and `shipped_month`. The job pre-computes `delivery_days = datediff(delivered_date, shipped_date)` as an integer column. This is a design choice: instead of storing the raw timestamp pair and computing the difference in every Gold query, the difference is computed once during the Bronze-to-Silver transformation. Every downstream query that asks "what was the average delivery time for DHL last month" just calls `AVG(delivery_days)` with a filter. `delivery_days` is null for shipments that haven't been delivered yet, which is correct. A validation rule ensures the value is non-negative when present, catching any source system data entry errors where `delivered_date < shipped_date`.
+
+---
+
+### Explicit schemas: why they matter
+
+The Bronze Parquet files written by DMS use specific physical types that map to the PostgreSQL column types they came from. A PostgreSQL `INTEGER` column becomes Parquet `INT32`. A PostgreSQL `NUMERIC(10,2)` column becomes Parquet `decimal128(10,2)`. The `_dms_timestamp` column is written as a plain `string`, not as a Parquet timestamp type, in the format `'YYYY-MM-DD HH:MM:SS.ffffff'`.
+
+If you let Spark infer the schema from the Parquet files, it does an extra full scan of every file in the directory before processing begins. For a directory with hundreds of CDC files, that's a full additional read of the entire table just to determine column types. With an explicit schema you skip that entirely.
+
+Explicit schemas also prevent silent type mismatches. If DMS ever writes a column with a different physical type due to a schema change in PostgreSQL, the job will fail immediately with a clear error rather than silently coercing types and producing wrong results. All six schemas live in `lib/schemas.py` and are the single source of truth for what Bronze contains.
+
+---
+
+### Local development workflow
+
+The full local development loop works without any AWS credentials. Everything runs in Docker using the same AWS Glue 4.0 image as production.
+
+```bash
+# One-time setup
+make setup        # creates .venv, installs Python dependencies
+make pull         # pulls the AWS Glue 4.0 Docker image (~3 GB, one time only)
+
+# Every development session
+make generate-bronze   # generates 6 test Parquet files in data/bronze/ that mirror real DMS output
+make run-all           # runs all 6 Silver jobs inside the Glue Docker container
+
+# After jobs finish, inspect performance
+make spark-ui          # starts Spark History Server at http://localhost:18080
+
+# Code quality
+make test        # runs the test suite
+make lint        # runs ruff linter
+make typecheck   # runs mypy type checker
+```
+
+`make setup` creates a `.venv` and installs the host-side Python tools (pytest, ruff, mypy, pandas, faker, pyarrow). These are used for the test suite, the linter, the type checker, and the `generate_bronze.py` script. They don't run inside Docker.
+
+`make pull` downloads the `amazon/aws-glue-libs:glue_libs_4.0.0_image_01` image. This is a 3 GB image that contains Spark 3.3, Python 3.10, Hadoop, and all the AWS Glue JARs pre-configured. You only need to pull it once.
+
+`make generate-bronze` runs `scripts/generate_bronze.py` on the host to create six Parquet files under `data/bronze/raw/public/`. Each file mirrors what real DMS output looks like: `Op='I'` on every row, `_dms_timestamp` as a plain string, integer columns as `int32`, decimal columns as `decimal128(10,2)`.
+
+`make run-all` runs all six Silver jobs in dependency order: dimension tables first, then fact tables. `fact_order_items` depends on the orders Bronze data which is also read by `fact_orders`, so the ordering doesn't create a blocking dependency, but running dimensions first is conventional. Each job runs in its own container invocation via `docker compose run --rm glue`.
+
+`make spark-ui` starts a second container running the Spark History Server. The event logs from completed jobs are written to `./spark-events` on the host (mounted into the container at `/tmp/spark-events`). The History Server reads those logs and serves the Spark UI at `http://localhost:18080`.
+
+The Docker container uses the same AWS Glue 4.0 image as production. "It works locally" always means "it works in AWS".
+
+---
+
+### Why the jobs run slowly locally
+
+Each job takes 30 to 60 seconds to produce output from 150 rows of test data. That's not a bug.
+
+The slowness is Spark startup overhead, not data processing time. Every job invocation starts a fresh JVM, loads all the Glue JARs from the 3 GB Docker image into memory, initialises a full SparkContext, and sets up the Spark History Server's event log writer. All of that happens before a single row is read. The actual data processing, reading 150 rows from a Parquet file, running a window function, filtering, writing output, takes milliseconds.
+
+In AWS this overhead is a one-time cost per job run. Glue G.1X workers are billed in 1 DPU (Data Processing Unit)-minute increments. Against millions of rows the startup overhead is a trivial fraction of total runtime and cost.
+
+There's also the 200 shuffle partitions. Spark defaults to `spark.sql.shuffle.partitions=200` for any operation that needs to redistribute data across the cluster: `GROUP BY`, `ORDER BY`, `JOIN`, and window functions. With 150 rows of test data, 198 of those 200 partitions are empty. Spark still creates them. Locally that means 200 tasks spin up and almost all of them do nothing. In AWS, Glue 4.0 has Adaptive Query Execution (AQE) enabled by default, which coalesces empty partitions automatically so you don't pay for wasted shuffle tasks against real data.
+
+---
+
+### Deploying to AWS
+
+The deployment workflow packages the shared library, uploads everything to S3, and creates or updates the Glue job definitions.
+
+```bash
+# Set your account ID (required once per terminal session)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile dev-admin)
+
+# Deploy: packages lib/, uploads scripts and lib.zip to S3, creates/updates Glue job definitions
+make deploy ENV=dev
+
+# Trigger all 6 jobs in AWS
+make trigger-all ENV=dev
+
+# Check status (run again after 2-3 minutes)
+make status-all ENV=dev
+```
+
+Here is what `make deploy` does step by step:
+
+**Step 1: Package lib/ into lib.zip.** The `--extra-py-files` argument in a Glue job definition accepts `.py` files or `.zip` files, not directory paths. `lib/` is a Python package directory with five modules. Zipping it preserves the package structure so that `from lib.cdc import reconcile` resolves correctly inside Glue workers.
+
+**Step 2: Upload job scripts to S3.** The six job scripts are synced to `s3://edp-dev-{account_id}-glue-scripts/glue-scripts/`. Only `.py` files are uploaded.
+
+**Step 3: Upload lib.zip to S3.** `lib.zip` is uploaded to `s3://edp-dev-{account_id}-glue-scripts/glue-scripts/lib.zip`.
+
+**Step 4: Create or update each Glue job definition.** For each of the six jobs, `aws glue create-job` is attempted. If the job already exists, that call returns an error and the Makefile falls through to `aws glue update-job`. The job definition sets the script location, the `--extra-py-files` path, the Bronze/Silver/Quarantine S3 paths, the Glue version (4.0), the worker type (G.1X), and enables Spark UI event logging.
+
+The code is identical between local and AWS. The only difference is the path parameters: `file://` locally, `s3://` in AWS.
+
+---
+
+### Inspecting Spark performance
+
+There are two ways to look at Spark performance depending on whether you're running locally or in AWS.
+
+**Locally:** After running jobs with `make run-all`, start the Spark History Server with `make spark-ui`. Open `http://localhost:18080` in a browser. The UI shows the DAG (Directed Acyclic Graph) of stages for each job run, individual task durations, shuffle read and write sizes, and any partition skew. The DAG view is the fastest way to find a bottleneck: a wide stage with many tasks taking unequal time usually means skewed data, and a stage that takes most of the total runtime is the one worth optimising.
+
+**In AWS:** In the AWS Glue console, open a job, click on a completed run, and click the "Spark UI" tab. AWS hosts the History Server for you directly using the event logs written to `s3://edp-dev-{account_id}-glue-scripts/spark-logs/`. The same DAG and stage views are available. Spark UI is enabled via `--enable-spark-ui` in the job definition, and event logs are written automatically to the `spark-logs/` prefix in the glue-scripts bucket.
+
+---
+
+### The Terraform change: adding the glue-scripts S3 bucket
+
+The Glue jobs needed a dedicated home for their scripts and library zip. The athena-results bucket already existed in the data-lake module, but mixing Glue scripts with Athena query results would make the bucket layout confusing and harder to manage with IAM policies.
+
+The `data-lake` Terraform module was updated to add a sixth bucket: `edp-{env}-{account_id}-glue-scripts`. This bucket holds the job scripts, the `lib.zip` package, and the Spark event logs. It follows the same naming convention as the other five buckets and has the same encryption and versioning settings.
+
+The IAM Glue role in the `iam-metadata` module was also updated to grant `s3:GetObject` on the new bucket. Without this, Glue workers would be able to start but would fail immediately when trying to load the job script or `lib.zip` from S3 at runtime. The Makefile's `GLUE_SCRIPTS_BUCKET` variable was updated to point to the new bucket name.
+
+---
+
+## The dbt analytics layer
+
+### What this phase does
+
+By the time data reaches Silver, it's clean, typed, and deduplicated. But it's still raw fact data: one row per order, one row per payment, one row per shipment. A business analyst can't open that and answer "which country generates the most revenue?" without writing SQL aggregations from scratch.
+
+The dbt (data build tool) layer takes Silver data and transforms it into Gold: a set of pre-aggregated tables where each table answers exactly one business question. You run `SELECT *` on a Gold table and the answer is right there, already calculated, already rounded, ready to connect to a dashboard.
+
+This phase lives in the `platform-dbt-analytics` repository.
+
+### What dbt is and why I use it
+
+dbt is a transformation tool for SQL. Instead of writing a Python script that runs SQL and manages table creation manually, I write SQL `SELECT` statements and dbt handles the rest: it figures out the correct order to run them (based on which models reference which), creates the tables or views in the database, runs data quality tests, and generates documentation.
+
+The key concept is that in dbt, a "model" is just a SQL file with a `SELECT` statement. dbt wraps that in a `CREATE TABLE AS` or `CREATE VIEW AS` automatically. This means I focus entirely on the business logic in SQL rather than on plumbing.
+
+dbt does not move data or run compute itself. It compiles SQL and sends it to the database engine (DuckDB (Duck Database) locally, Athena in AWS) which does the actual work.
+
+### Why Docker for both local development and CI
+
+In the Glue phase, Docker gave me a full local Spark runtime so jobs ran offline. For dbt, there is no local Athena to run against. But Docker still makes sense for a different reason: it guarantees that the exact same dbt version, Python version, and adapter versions run on my laptop, on every other developer's laptop, and in GitHub Actions (CI). Without Docker, different installs can produce different results and "works on my machine" becomes a real problem.
+
+The trick is that local development does not use Athena at all. I use DuckDB instead, which is an embedded analytics database that can read Parquet files directly from the local filesystem. DuckDB speaks standard SQL that is compatible with Athena, so the same model SQL works in both places.
+
+The setup is:
+- **Local:** Docker container running dbt with DuckDB, reading Silver Parquet files from `platform-glue-jobs/data/silver/`
+- **AWS:** Same Docker container, same dbt, but connecting to Athena and reading from S3
+
+### The repository layout
+
+```
+platform-dbt-analytics/
+├── Dockerfile                    <- Python 3.11 image with dbt-core, dbt-duckdb, dbt-athena-community
+├── docker-compose.yml            <- two services: dbt-local (DuckDB) and dbt-aws (Athena)
+├── Makefile                      <- all commands live here
+├── requirements.txt              <- pinned: dbt-core 1.8.7, dbt-duckdb 1.8.4, dbt-athena-community 1.8.3
+├── dbt_project.yml               <- project config: materialization strategy, schema names
+├── packages.yml                  <- dbt_utils and dbt_expectations packages
+├── profiles/
+│   └── profiles.yml              <- connection config for local (DuckDB) and dev/staging/prod (Athena)
+├── models/
+│   ├── staging/                  <- light cleaning of Silver sources, one model per table
+│   ├── intermediate/             <- joins across staging models, reusable building blocks
+│   └── marts/                   <- Gold tables, one per business question
+│       ├── finance/
+│       ├── customer/
+│       ├── product/
+│       └── operations/
+├── macros/
+│   ├── generate_schema_name.sql  <- controls which schema each layer writes to
+│   └── safe_divide.sql           <- null-safe division (avoids divide-by-zero errors)
+├── tests/
+│   └── generic/
+│       └── assert_positive_value.sql  <- custom data test for numeric columns
+└── .github/workflows/ci.yml      <- CI: build image, run models, run tests (all against DuckDB)
+```
+
+### How the three-layer model architecture works
+
+dbt projects are structured in layers. Each layer has a single responsibility.
+
+**Staging layer** (`models/staging/`)
+
+Staging models sit directly on top of the Silver Parquet sources. Each model does only light work: selecting the columns I want, renaming a column for clarity, lowercasing a string for consistency. No joins, no aggregations, no business logic. The job of staging is to give downstream models a stable, clean interface so that if the Silver schema ever changes, I only need to fix it in one staging model rather than everywhere.
+
+There is one staging model per Silver table:
+- `stg_customers` — customer records
+- `stg_products` — product catalogue
+- `stg_orders` — order headers
+- `stg_order_items` — order line items
+- `stg_payments` — payment transactions
+- `stg_shipments` — shipment records
+
+Staging models are materialized as **views** (no data stored, the SQL runs on every query).
+
+**Intermediate layer** (`models/intermediate/`)
+
+Intermediate models join staging models together to create richer datasets that multiple Gold models can reuse. Instead of repeating the same join logic in five different Gold models, I write it once here.
+
+There are two intermediate models:
+- `int_orders_enriched` — joins orders with customers, payments, and shipments. One row per order with all the context attached.
+- `int_product_sales` — joins order items with products. One row per line item with product name, category, and brand attached.
+
+Intermediate models are also materialized as **views** so no physical table is created.
+
+**Marts layer** (`models/marts/`)
+
+Marts are the Gold tables. Each one is a pre-aggregated answer to a specific business question. They are materialized as **tables** so the aggregation is computed once and stored. Dashboards and Redshift Serverless query these tables directly.
+
+### The seven Gold tables and what business question each answers
+
+**`revenue_by_country`** (`marts/finance/`)
+
+Business question: "Which countries generate the most revenue?"
+
+This table has one row per country. It filters to completed payments only and shows total orders, total customers, total revenue, and average order value. The rows are ordered from highest revenue to lowest so the top markets are visible immediately.
+
+```sql
+SELECT * FROM gold.revenue_by_country;
+-- country | total_orders | total_customers | total_revenue | avg_order_value
+-- Germany |          28  |            12   |     14823.50  |          529.41
+-- France  |          21  |             9   |     10234.00  |          487.33
+-- ...
+```
+
+**`monthly_revenue_trend`** (`marts/finance/`)
+
+Business question: "How is revenue trending month over month?"
+
+One row per year-month combination. Covers all orders (not just paid ones) so cancelled orders are visible alongside revenue. This lets the business see both growth and cancellation rate over time.
+
+```sql
+SELECT * FROM gold.monthly_revenue_trend;
+-- order_year | order_month | total_orders | unique_customers | total_revenue | cancelled_orders
+--       2023 |           1 |           12 |               9  |       5821.00 |                1
+--       2023 |           2 |           14 |              11  |       7102.50 |                2
+-- ...
+```
+
+**`payment_method_performance`** (`marts/finance/`)
+
+Business question: "Which payment methods succeed and which fail?"
+
+One row per payment method. Shows the number of successful, failed, and refunded transactions, the success rate as a percentage, total amount processed, and revenue actually captured (completed transactions only). This is the table a finance team looks at to decide whether to drop an underperforming payment method.
+
+```sql
+SELECT * FROM gold.payment_method_performance;
+-- payment_method | total_transactions | successful | failed | success_rate_pct | total_processed | revenue_captured
+-- credit_card    |                 58 |         48 |      4 |            82.76 |        31421.00 |         26100.00
+-- paypal         |                 37 |         32 |      2 |            86.49 |        19200.00 |         16800.00
+-- ...
+```
+
+**`customer_segments`** (`marts/customer/`)
+
+Business question: "How are customers segmented by value and purchase behaviour?"
+
+One row per customer. Each customer gets two classification labels. The `segment` column is based on total lifetime spend: VIP (500 or more), Regular (200 to 499), Low Value (1 to 199), or Never Ordered (no purchases). The `order_frequency_band` is based on total order count: Loyal (4 or more), Occasional (2 to 3), One-Time (1), or No Orders. Rows are ordered by lifetime value descending.
+
+```sql
+SELECT * FROM gold.customer_segments;
+-- customer_id | first_name | country | total_orders | lifetime_value | segment | order_frequency_band
+--           5 | Emma       | Germany |            7 |         921.50 | VIP     | Loyal
+--          12 | Carlos     | Spain   |            3 |         412.00 | Regular | Occasional
+-- ...
+```
+
+**`product_category_performance`** (`marts/product/`)
+
+Business question: "Which product categories and brands drive the most revenue?"
+
+One row per category-brand combination. Shows how many distinct products each brand has, total units sold, total revenue, and average revenue per unit. Useful for deciding where to expand or cut inventory.
+
+```sql
+SELECT * FROM gold.product_category_performance;
+-- category     | brand      | total_orders | products_in_category | total_units_sold | total_revenue | avg_revenue_per_unit
+-- Electronics  | TechPro    |           41 |                    3 |               88 |      21400.00 |               243.18
+-- Clothing     | StyleCo    |           35 |                    2 |               70 |      12600.00 |               180.00
+-- ...
+```
+
+**`top_selling_products`** (`marts/product/`)
+
+Business question: "Which specific products sell the most?"
+
+One row per product, ranked by total revenue. Includes the product name, category, brand, units sold, total revenue, average revenue per unit, and a `revenue_rank` column (1 = highest revenue). A sales team can look at this table to see their best sellers instantly.
+
+```sql
+SELECT * FROM gold.top_selling_products;
+-- revenue_rank | product_name          | category    | total_units_sold | total_revenue
+--            1 | TechPro Pro Electonic |Electronics  |               18 |       5400.00
+--            2 | NovaTech Max Electonic| Electronics |               15 |       4800.00
+-- ...
+```
+
+**`carrier_delivery_performance`** (`marts/operations/`)
+
+Business question: "How do shipping carriers compare on speed and reliability?"
+
+One row per carrier. Shows total shipments, how many were delivered vs failed, delivery success rate as a percentage, average delivery days, fastest delivery, and slowest delivery. An operations team uses this to decide which carriers to prioritise and whether to renegotiate contracts.
+
+```sql
+SELECT * FROM gold.carrier_delivery_performance;
+-- carrier   | total_shipments | delivered | failed | delivery_success_rate_pct | avg_delivery_days
+-- DHL       |              28 |        24 |      2 |                     85.71 |              3.80
+-- FedEx     |              22 |        19 |      1 |                     86.36 |              4.10
+-- ...
+```
+
+### How sources are defined so local and AWS both work
+
+The Silver sources are defined once in `models/staging/_sources.yml`. There is a trick that makes both DuckDB and Athena work from the same file.
+
+For DuckDB, each source table has a `meta.external_location` property that tells dbt-duckdb to call `read_parquet()` on a local path:
+
+```yaml
+- name: customers
+  meta:
+    external_location: "read_parquet('/data/silver/dim_customer/**/*.parquet', hive_partitioning=true)"
+```
+
+For Athena, that property is ignored. Instead, dbt-athena looks at the `database` and `schema` keys on the source and finds the table in the Glue Data Catalog:
+
+```yaml
+sources:
+  - name: silver
+    database: "{{ env_var('DBT_SILVER_DATABASE', 'edp_dev_silver') }}"
+    schema:   "{{ env_var('DBT_SILVER_SCHEMA',   'edp_dev_silver') }}"
+```
+
+One file, two targets. Switching between them is just a matter of which profile you use.
+
+### The materialization strategy and schema names
+
+```
+staging     -> view    -> schema: silver   (reads from Silver source, no physical storage)
+intermediate -> view   -> schema: main     (joins, no physical storage)
+marts       -> table   -> schema: gold     (pre-aggregated, stored permanently)
+```
+
+The `generate_schema_name` macro controls this. By default dbt would prefix the schema name with the target schema (e.g. `main_silver`). My macro overrides this to use the custom name exactly as written, so models land in `silver`, `gold`, or `main` cleanly.
+
+### The Makefile commands
+
+All commands run inside Docker. You never need Python or dbt installed directly on your machine.
+
+```bash
+# Build the Docker image (one time after cloning or changing requirements.txt)
+make setup
+
+# Run all 15 models locally against DuckDB
+make run-local
+
+# Run all 91 data quality tests locally against DuckDB
+make test-local
+
+# Generate and serve the dbt documentation site at http://localhost:8080
+make docs-local
+
+# Open an interactive DuckDB Python shell to query the Gold tables directly
+make query
+
+# Deploy to AWS Athena (dev environment)
+make deploy ENV=dev
+
+# Run tests against AWS Athena (dev environment)
+make test-aws ENV=dev
+
+# Remove compiled artifacts and the local DuckDB database file
+make clean
+```
+
+### Local development workflow step by step
+
+This is the full sequence from a clean checkout to working Gold tables on your local machine.
+
+**Step 1: Generate Bronze test data**
+
+The local Silver Parquet files are produced by the Glue jobs. If they don't exist yet, generate them first (from the `platform-glue-jobs` directory):
+
+```bash
+cd platform-glue-jobs
+make setup             # install host Python tools into .venv
+make generate-bronze   # create test Parquet files in data/bronze/
+make run-all           # run all 6 Glue jobs locally, produce data/silver/
+```
+
+After this, `platform-glue-jobs/data/silver/` contains six directories of Parquet files.
+
+**Step 2: Build the dbt Docker image**
+
+```bash
+cd platform-dbt-analytics
+make setup
+```
+
+This runs `docker compose build` to create the `edp-dbt:local` image. It installs dbt-core, dbt-duckdb, and dbt-athena-community into a Python 3.11 container. You only need to do this once, or again if `requirements.txt` changes.
+
+**Step 3: Run the models**
+
+```bash
+make run-local
+```
+
+dbt reads `profiles/profiles.yml`, connects to a DuckDB database at `/tmp/edp_analytics.duckdb`, and runs all 15 models in the correct dependency order. The Silver Parquet files mounted at `/data/silver/` inside the container are read by DuckDB's `read_parquet()` function via the `meta.external_location` definitions in `_sources.yml`.
+
+The output shows each model, what it created (view or table), and how long it took:
+
+```
+1 of 15 OK created sql view model silver.stg_customers ............. [OK in 0.14s]
+...
+15 of 15 OK created sql table model gold.revenue_by_country ........ [OK in 0.30s]
+Completed successfully. PASS=15 WARN=0 ERROR=0 SKIP=0 TOTAL=15
+```
+
+**Step 4: Run the data quality tests**
+
+```bash
+make test-local
+```
+
+This runs 91 tests against the models just built. Tests include: `not_null` on every primary key column, `unique` on every primary key column, `accepted_values` checks on status columns, `relationships` checks that foreign keys match primary keys in the referenced table, and `assert_positive_value` on monetary and quantity columns.
+
+**Step 5: Query the Gold tables**
+
+```bash
+make query
+```
+
+This opens an interactive Python session inside the Docker container with a DuckDB connection already open. Run any SQL you want:
+
+```python
+conn.sql("SELECT * FROM gold.revenue_by_country").show()
+conn.sql("SELECT * FROM gold.customer_segments WHERE segment = 'VIP'").show()
+conn.sql("SELECT * FROM gold.carrier_delivery_performance").show()
+```
+
+Type `exit()` or press `Ctrl+D` to leave.
+
+**Step 6: View the documentation**
+
+```bash
+make docs-local
+```
+
+This generates the dbt documentation site and serves it at `http://localhost:8080`. The docs show every model, every column, every test, and an interactive lineage graph that shows how data flows from sources through staging, intermediate, and into the Gold tables.
+
+### Deploying to AWS (Athena)
+
+Before running dbt against AWS, the following must be true:
+
+1. Terraform is applied (`make apply dev`) — this creates the `edp_dev_silver` and `edp_dev_gold` Glue Catalog databases and the Athena workgroup
+2. The CDC simulator has run and Bronze data is in S3
+3. The Glue PySpark jobs have run and Silver Parquet files are in `s3://edp-dev-{account_id}-silver/`
+4. A Glue Crawler has been run to register the Silver tables in the Glue Catalog (see below)
+
+**Step 1: Register Silver tables in the Glue Catalog**
+
+The Glue jobs write Parquet files directly to S3 but do not register them in the catalog automatically. A Glue Crawler scans the Silver bucket and creates the table definitions. This only needs to run once after the first Glue job run, or after any schema change.
+
+```bash
+# Create the crawler (first time only)
+aws glue create-crawler \
+  --name edp-dev-silver-crawler \
+  --role edp-dev-glue-role \
+  --database-name edp_dev_silver \
+  --targets '{"S3Targets":[{"Path":"s3://edp-dev-{account_id}-silver/"}]}' \
+  --profile dev-admin
+
+# Run it
+aws glue start-crawler --name edp-dev-silver-crawler --profile dev-admin
+
+# Wait for it to finish (state changes from RUNNING to READY)
+aws glue get-crawler --name edp-dev-silver-crawler --profile dev-admin \
+  --query 'Crawler.State' --output text
+```
+
+This registers six tables in `edp_dev_silver`: `dim_customer`, `dim_product`, `fact_orders`, `fact_order_items`, `fact_payments`, `fact_shipments`. The `_sources.yml` `identifier` fields map these catalog names to the logical source names that staging models use.
+
+**Step 2: Run dbt against Athena**
+
+```bash
+make deploy ENV=dev
+```
+
+The `ATHENA_RESULTS_BUCKET` defaults to `edp-dev-{account_id}-athena-results` in `docker-compose.yml`. No environment variables need to be exported manually for a standard dev run. The container mounts `~/.aws` from the host so the `dev-admin` profile is available.
+
+dbt sends SQL to Athena, which reads the Silver Glue Catalog tables and writes Gold tables back to S3, registering them in `edp_dev_gold`. All 15 models run: 6 staging views, 2 intermediate views, and 7 Gold tables.
+
+**Step 3: Run tests against AWS**
+
+```bash
+make test-aws ENV=dev
+```
+
+Runs all 91 data quality tests against the real Gold tables in Athena. Tests verify the actual data in S3, not the local DuckDB fixture.
+
+![Athena Gold tables](images/Athena.png)
+
+### What changes between local and AWS
+
+Nothing in the model SQL changes. The only difference is the profile used:
+
+| Setting | Local (DuckDB) | AWS (Athena) |
+|---|---|---|
+| Engine | DuckDB reads local Parquet | Athena queries S3 via Glue Catalog |
+| Silver source | `read_parquet('data/silver/...')` via `DBT_SILVER_PATH` | Glue Catalog tables in `edp_dev_silver` (registered by crawler) |
+| Gold output | DuckDB file at `/tmp/edp_analytics.duckdb` | S3 Parquet + Glue Catalog in `edp_dev_gold` |
+| AWS credentials | Not needed | `~/.aws` profile `dev-admin` |
+| Cost | Free | Athena charges per byte scanned |
+
+### Data quality tests
+
+The test suite has 91 tests across all 15 models. Here is what each test type does:
+
+**`not_null`** — checks that a column has no null values. Applied to every primary key and every non-nullable column. If a primary key is null, something upstream broke.
+
+**`unique`** — checks that a column has no duplicate values. Applied to every primary key. If an order ID appears twice in `stg_orders`, the CDC reconciliation in Glue failed.
+
+**`accepted_values`** — checks that every value in a column is in a predefined list. Applied to status columns like `order_status`, `payment_status`, and `delivery_status`. If an unexpected value appears, it means the source system added a new status that the pipeline doesn't know about yet.
+
+**`relationships`** — checks that every value in a foreign key column exists in the referenced table. For example, every `customer_id` in `stg_orders` must exist in `stg_customers`. This catches orphaned records.
+
+**`assert_positive_value`** — a custom generic test that checks numeric columns are greater than zero. Applied to `unit_price`, `quantity`, `line_total`, `amount`, and performance metrics. A negative price or zero quantity indicates corrupt data.
+
+### The packages used
+
+**dbt_utils** (by dbt Labs): a collection of utility macros and tests. Used here for helper functions across the project.
+
+**dbt_expectations** (by Calogica): a test library inspired by the Great Expectations framework. Adds tests like `expect_column_values_to_be_between`, `expect_table_row_count_to_be_between`, and more. Available for future test additions without writing custom SQL.
+
+### The macros
+
+**`safe_divide(numerator, denominator)`** — wraps any division in `nullif(denominator, 0)` so that dividing by zero returns null instead of throwing an error. Used in every Gold model that calculates a rate or average. For example:
+
+```sql
+round(sum(line_total) / nullif(sum(quantity), 0), 2) as avg_revenue_per_unit
+```
+
+If a product somehow had zero quantity sold in a period (which shouldn't happen but could due to data issues), this returns null instead of crashing the query.
+
+**`generate_schema_name(custom_schema_name, node)`** — overrides dbt's default schema naming so that the custom schema name is used exactly as written. Without this override, dbt would prefix everything with the target schema name, turning `gold` into `main_gold` in DuckDB. With the override, models land cleanly in `silver`, `gold`, or `main`.
+
+### The CI pipeline
+
+Every push to the `platform-dbt-analytics` repository triggers a GitHub Actions workflow defined in `.github/workflows/ci.yml`. The workflow has two jobs:
+
+**Job 1 — Build Docker image**
+
+Builds the dbt Docker image and caches it using GitHub Actions cache so downstream jobs do not rebuild from scratch on every push.
+
+**Job 2 — dbt local (DuckDB)**
+
+Runs after the image is built. Steps:
+
+1. Checkout the repository
+2. Install dbt dependencies (`pip install -r requirements.txt`)
+3. Run `dbt deps` to download dbt packages (dbt-utils)
+4. Run `dbt run --target local` against DuckDB — compiles and executes all 15 models
+5. Run `dbt test --target local` — runs all 91 data quality tests
+6. Run `dbt docs generate` — confirms documentation compiles without errors
+7. Upload dbt artifacts (manifest.json, run_results.json, catalog.json) as a downloadable GitHub Actions artifact
+
+No AWS credentials are needed. The Silver data comes from six small Parquet fixture files committed directly to the repository at `data/silver/`. Each file contains one valid row per table with the correct schema and status values, enough to prove every model compiles and every test passes.
+
+The `DBT_SILVER_PATH` environment variable controls where DuckDB looks for the Parquet files. In CI it is set to `data/silver` (relative to the project root). In Docker locally it defaults to `/data/silver` (the container mount path). This means the same `_sources.yml` works in both environments without any changes.
+
+**What CI does and does not validate**
+
+CI catches: broken SQL, wrong column names, missing joins, incorrect model dependencies, and failing data quality tests. It catches these on every push, before anything reaches AWS.
+
+CI does not run against real AWS data. The Athena target is run manually using `make deploy ENV=dev` after applying Terraform and running the Glue jobs. The full end-to-end AWS run has been verified: all 15 models pass against real Silver data in Athena with real rows in every Gold table.
+
+**Current CI status: all steps passing green (verified). AWS end-to-end: verified, 15/15 models, 0 errors.**
+
+---
+
 ## Concepts explained simply
 
 ### What is CDC (Change Data Capture)?
@@ -1379,22 +2169,47 @@ This is intentional. `force_destroy = false` on the Bronze bucket protects the C
 
 ---
 
+## CI/CD pipelines
+
+Every repo that has deployable code has two GitHub Actions workflows: a CI workflow that runs on every pull request and push to main, and a deploy workflow that triggers automatically after CI passes.
+
+AWS authentication uses OIDC (OpenID Connect) so no long-lived access keys are stored anywhere. GitHub exchanges a short-lived token for temporary AWS credentials at runtime by assuming the `edp-{env}-github-actions-role` IAM (Identity and Access Management) role.
+
+The promotion path is: dev deploys automatically on every merge to main, staging and prod require a manual `workflow_dispatch` trigger.
+
+| Repo | CI | Deploy |
+|---|---|---|
+| terraform-bootstrap | fmt check + validate across all 3 environments | n/a (one-time setup) |
+| terraform-platform-infra-live | fmt check + validate across all 3 environments | OIDC + terraform init/plan/apply |
+| platform-cdc-simulator | ruff lint + mypy + unit tests + integration tests + Docker build | Docker image push to registry |
+| platform-glue-jobs | ruff lint + mypy + unit tests + all 6 Silver jobs run in AWS Glue Docker image | S3 upload + Glue job create/update |
+| platform-dbt-analytics | dbt deps + run + test against DuckDB (local Silver Parquet) | dbt run + test against Athena |
+
+The Glue integration tests are the most important. All 6 Silver PySpark jobs run inside the real `amazon/aws-glue-libs:glue_libs_4.0.0_image_01` Docker image on every CI run, which means the actual Spark logic is proven before any deployment happens. The Docker image is cached between runs using GitHub Actions cache so subsequent runs take around 30 seconds instead of 2-3 minutes.
+
+---
+
 ## Build status
 
 | Component | Status |
 |---|---|
 | Terraform remote state (bootstrap) | Done |
 | VPC and networking | Done |
-| S3 data lake (all 5 buckets) | Done |
+| S3 data lake (all 6 buckets, including glue-scripts) | Done |
 | KMS key, IAM roles, Glue Catalog | Done |
 | RDS PostgreSQL and DMS CDC | Done |
-| Glue config and Athena workgroup | Done |
+| Glue config, Athena workgroup, and Silver Glue Crawler | Done |
 | Redshift Serverless | Done |
 | MWAA orchestration environment | Done |
 | CDC simulator (Phase 1 complete, Bronze data in S3) | Done |
-| Glue PySpark jobs (Bronze to Silver) | In progress |
-| dbt models (Silver to Gold) | Planned |
-| Airflow DAGs | Planned |
+| Glue PySpark jobs (Bronze to Silver) | Done |
+| dbt models (Silver to Gold, 7 Gold tables) | Done |
+| dbt CI pipeline (DuckDB, all 91 tests passing) | Done |
+| dbt run against AWS Athena (end-to-end, 15/15 models) | Done |
+| CI/CD pipelines (all 5 repos, OIDC auth, Glue Docker tests) | Done |
+| Airflow DAG (edp_pipeline), local Docker validation | Done |
+| MWAA deployment and DAG upload to AWS | Done |
+| MWAA end-to-end AWS DAG validation | In progress |
 | AI Operations Agent | Planned |
 
 ---
