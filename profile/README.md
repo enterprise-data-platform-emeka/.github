@@ -2,7 +2,7 @@
 
 I built this platform to demonstrate a full production-grade data engineering pipeline on AWS (Amazon Web Services). It takes raw data from a PostgreSQL database, captures every change in real time, moves it through three transformation layers, and delivers business-ready aggregations to analysts through a dashboard. The same way it works inside real companies.
 
-This is not a simplified demo. Every decision here — encryption, IAM (Identity and Access Management) roles, VPC (Virtual Private Cloud) isolation, error handling, testing, CI/CD — mirrors what a real engineering team would build. Each repository has its own detailed README explaining what it does, how to run it, and the reasoning behind every key decision.
+This is not a simplified demo. Every decision here (encryption, IAM (Identity and Access Management) roles, VPC (Virtual Private Cloud) isolation, error handling, testing, CI/CD) mirrors what a real engineering team would build. Each repository has its own detailed README explaining what it does, how to run it, and the reasoning behind every key decision.
 
 ---
 
@@ -205,12 +205,137 @@ Each step depends on the previous. Do not skip steps.
 | Step | Repository | What it does |
 |---|---|---|
 | 1 | terraform-bootstrap | Create remote state infrastructure |
-| 2–8 | terraform-platform-infra-live | Create all AWS platform infrastructure |
+| 2-8 | terraform-platform-infra-live | Create all AWS platform infrastructure |
 | 9 | platform-cdc-simulator | Simulate source data for testing |
 | 10 | platform-glue-jobs | Build and deploy Bronze → Silver jobs |
 | 11 | platform-dbt-analytics | Build and deploy Silver → Gold models |
 | 12 | platform-orchestration-mwaa-airflow | Deploy the orchestration DAG |
 | 13 | platform-ops-agent | Deploy the AI Operations Agent |
+
+---
+
+## Running the pipeline end to end
+
+There are two ways to run the full pipeline. Both assume the AWS infrastructure is already deployed (`make apply dev` in `terraform-platform-infra-live`).
+
+---
+
+### Path A: Manual run
+
+This path runs each step from your terminal. Use it when you want full control over timing, want to inspect intermediate outputs, or are debugging a specific layer.
+
+**Step 1: Start the DMS replication task**
+
+The DMS (Database Migration Service) task does not start automatically after a Terraform apply. Start it manually once per session.
+
+Run in `terraform-platform-infra-live`:
+```bash
+aws dms start-replication-task \
+  --replication-task-arn $(aws dms describe-replication-tasks \
+    --filters Name=replication-task-id,Values=edp-dev-dms-task \
+    --query 'ReplicationTasks[0].ReplicationTaskArn' \
+    --output text \
+    --profile dev-admin) \
+  --start-replication-task-type reload-target \
+  --profile dev-admin
+```
+
+**Step 2: Open the SSM tunnel to RDS**
+
+RDS lives in private subnets. The simulator connects to it via an SSM (Systems Manager) port-forwarding session through the bastion EC2 instance. Keep this terminal open for the duration of the session.
+
+Run in `terraform-platform-infra-live`:
+```bash
+BASTION_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=edp-dev-bastion" "Name=instance-state-name,Values=running" \
+  --query "Reservations[0].Instances[0].InstanceId" \
+  --output text \
+  --profile dev-admin) && \
+RDS_HOST=$(aws rds describe-db-instances \
+  --db-instance-identifier edp-dev-postgres \
+  --query "DBInstances[0].Endpoint.Address" \
+  --output text \
+  --profile dev-admin) && \
+aws ssm start-session \
+  --target "${BASTION_ID}" \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters "{\"host\":[\"${RDS_HOST}\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"5432\"]}" \
+  --profile dev-admin
+```
+
+**Step 3: Fetch the database password from SSM Parameter Store**
+
+Run in `platform-cdc-simulator`:
+```bash
+DB_PASSWORD=$(aws ssm get-parameter \
+  --name /edp/dev/db_password \
+  --with-decryption \
+  --query Parameter.Value \
+  --output text \
+  --profile dev-admin)
+```
+
+**Step 4: Run the CDC simulator**
+
+In a new terminal, run the simulator against RDS via the tunnel. It creates the schema, seeds reference data, then simulates continuous OLTP traffic that DMS captures to Bronze S3.
+
+Run in `platform-cdc-simulator`:
+```bash
+ENVIRONMENT=dev \
+DB_HOST=localhost \
+DB_PORT=5432 \
+DB_NAME=ecommerce \
+DB_USER=postgres \
+DB_PASSWORD="${DB_PASSWORD}" \
+python main.py simulate
+```
+
+Let it run for a few minutes so DMS captures inserts to Bronze. Press Ctrl+C when enough data has landed.
+
+**Step 5: Trigger the Airflow DAG in the MWAA UI**
+
+Open the MWAA web UI (find the URL in the AWS Console under MWAA or in the Terraform output), navigate to DAGs, and trigger `edp_pipeline` manually. The pipeline runs in this order:
+
+```
+silver_dim_customer  |
+silver_dim_product   |
+silver_fact_orders   +---> silver_complete -> run_silver_crawler -> gold_dbt_run -> gold_dbt_test -> pipeline_complete
+silver_fact_payments |
+silver_fact_shipments|
+silver_fact_order_items
+```
+
+All six Silver Glue jobs run in parallel. The rest runs sequentially. The full pipeline takes around 6-8 minutes.
+
+**Step 6: Verify the output**
+
+Query the Gold tables in the Athena console (workgroup: `edp-dev-workgroup`, database: `edp_dev_gold`). Or connect to Redshift Serverless and use Spectrum to query Gold directly from S3.
+
+---
+
+### Path B: GitHub Actions run
+
+This path assumes all code is already deployed to AWS (infra, Glue jobs, dbt, DAG). Use it for production-style runs where the pipeline is triggered programmatically after code changes land.
+
+**Step 1: Deploy infrastructure (if changed)**
+
+Push changes to `terraform-platform-infra-live`. The `deploy.yml` workflow runs automatically for dev and requires manual approval for staging and prod.
+
+**Step 2: Deploy Glue jobs (if changed)**
+
+Push changes to `platform-glue-jobs`. The `deploy.yml` workflow uploads job scripts to S3 and updates the Glue job definitions.
+
+**Step 3: Deploy dbt models (if changed)**
+
+Push changes to `platform-dbt-analytics`. The `ci.yml` workflow tests models against DuckDB. The `deploy.yml` workflow runs `dbt run` and `dbt test` against Athena in the target environment.
+
+**Step 4: Deploy the DAG (if changed)**
+
+Push changes to `platform-orchestration-mwaa-airflow`. The `deploy.yml` workflow uploads the DAG to the MWAA S3 bucket. The new version appears in the MWAA UI within 30 seconds.
+
+**Step 5: Trigger the pipeline**
+
+In `platform-orchestration-mwaa-airflow`, go to Actions, select "Trigger EDP Pipeline", click "Run workflow", choose your environment (dev, staging, or prod), and click the green button. The workflow calls the MWAA API to trigger `edp_pipeline` and prints confirmation. Monitor progress in the MWAA UI.
 
 ---
 
