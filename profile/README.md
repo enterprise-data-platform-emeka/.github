@@ -9,53 +9,42 @@ This is not a simplified demo. Every decision here (encryption, IAM (Identity an
 ## Architecture
 
 ```mermaid
-flowchart TB
-    subgraph CTRL["Control Plane"]
-        direction LR
-        MWAA["MWAA\nAirflow Orchestration"]
-        CW["CloudWatch\n+ EventBridge"]
-        AI["AI Ops Agent\nECS Fargate + Claude"]
+flowchart TD
+    subgraph Source ["Source Layer"]
+        direction TB
+        Postgres[PostgreSQL RDS\nWAL Log] --> DMS[AWS DMS CDC]
+        DMS --> S3Raw[S3 Data Lake\nBronze: Raw CDC Parquet]
     end
 
-    subgraph SRC["Source Layer"]
-        PG[("PostgreSQL\nRDS")]
-        DMS["AWS DMS\nCDC Replication"]
+    subgraph Control ["Control Plane"]
+        direction TB
+        CW[CloudWatch + EventBridge] --> AI[AI Ops Agent\nECS Fargate + Claude]
+        AI --> MWAA[MWAA Airflow Orchestration]
+        MWAA -.->|auto-recover| AI
     end
 
-    subgraph LAKE["S3 Data Lake"]
-        direction LR
-        BRONZE["Bronze\nRaw CDC Parquet"]
-        SILVER["Silver\nCleaned Parquet"]
-        GOLD["Gold\nAggregated Parquet"]
-        QUARANTINE["Quarantine\nInvalid Records"]
+    subgraph Processing ["Processing Layer"]
+        direction TB
+        Glue[Glue PySpark\nBronze to Silver] --> Silver[Silver: Cleaned Parquet]
+        Silver --> DBT[dbt + Athena\nSilver to Gold]
+        DBT --> Gold[Gold: Aggregated Parquet]
     end
 
-    subgraph PROC["Processing Layer"]
-        direction LR
-        GLUE["Glue PySpark\nBronze to Silver"]
-        DBT["dbt + Athena\nSilver to Gold"]
+    subgraph Serving ["Serving Layer"]
+        Redshift[Redshift Serverless + Spectrum] --> BI[BI Dashboards]
     end
 
-    subgraph SERVE["Serving Layer"]
-        RS["Redshift Serverless\n+ Spectrum"]
-        BI["BI Dashboard"]
-    end
+    S3Raw --> Glue
+    MWAA -->|triggers| Glue
+    Glue -->|valid records| Silver
+    Glue -.->|invalid records| Quarantine[Quarantine\nInvalid Records]
+    Silver --> DBT
+    Gold --> Redshift
+    S3Raw -.->|quarantine bad batches| Quarantine
+    MWAA -.->|triggers dbt models| DBT
 
-    PG -->|"WAL (Write-Ahead Log)"| DMS
-    DMS -->|"Parquet files"| BRONZE
-    BRONZE --> GLUE
-    GLUE -->|valid records| SILVER
-    GLUE -.->|invalid records| QUARANTINE
-    SILVER --> DBT
-    DBT --> GOLD
-    GOLD --> RS
-    RS --> BI
-
-    MWAA -->|triggers Glue jobs| GLUE
-    MWAA -->|triggers dbt models| DBT
-    CW -->|structured events| AI
-    AI -->|auto-recover via Airflow API| MWAA
-    AI -.->|quarantine bad batches| QUARANTINE
+    classDef layer fill:#f0f4f8,stroke:#333,stroke-width:2px,rx:10,ry:10;
+    class Source,Control,Processing,Serving layer;
 ```
 
 ---
