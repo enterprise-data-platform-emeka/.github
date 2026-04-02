@@ -9,53 +9,42 @@ This is not a simplified demo. Every decision here (encryption, IAM (Identity an
 ## Architecture
 
 ```mermaid
-flowchart TB
-    subgraph CTRL["Control Plane"]
-        direction LR
-        MWAA["MWAA\nAirflow Orchestration"]
-        CW["CloudWatch\n+ EventBridge"]
-        AI["AI Ops Agent\nECS Fargate + Claude"]
+flowchart TD
+    subgraph Source ["Source Layer"]
+        direction TB
+        Postgres[PostgreSQL RDS\nWAL Log] --> DMS[AWS DMS CDC]
+        DMS --> S3Raw[S3 Data Lake\nBronze: Raw CDC Parquet]
     end
 
-    subgraph SRC["Source Layer"]
-        PG[("PostgreSQL\nRDS")]
-        DMS["AWS DMS\nCDC Replication"]
+    subgraph Control ["Control Plane"]
+        direction TB
+        CW[CloudWatch + EventBridge] --> AI[AI Ops Agent\nECS Fargate + Claude]
+        AI --> MWAA[MWAA Airflow Orchestration]
+        MWAA -.->|auto-recover| AI
     end
 
-    subgraph LAKE["S3 Data Lake"]
-        direction LR
-        BRONZE["Bronze\nRaw CDC Parquet"]
-        SILVER["Silver\nCleaned Parquet"]
-        GOLD["Gold\nAggregated Parquet"]
-        QUARANTINE["Quarantine\nInvalid Records"]
+    subgraph Processing ["Processing Layer"]
+        direction TB
+        Glue[Glue PySpark\nBronze to Silver] --> Silver[Silver: Cleaned Parquet]
+        Silver --> DBT[dbt + Athena\nSilver to Gold]
+        DBT --> Gold[Gold: Aggregated Parquet]
     end
 
-    subgraph PROC["Processing Layer"]
-        direction LR
-        GLUE["Glue PySpark\nBronze to Silver"]
-        DBT["dbt + Athena\nSilver to Gold"]
+    subgraph Serving ["Serving Layer"]
+        Redshift[Redshift Serverless + Spectrum] --> BI[BI Dashboards]
     end
 
-    subgraph SERVE["Serving Layer"]
-        RS["Redshift Serverless\n+ Spectrum"]
-        BI["BI Dashboard"]
-    end
+    S3Raw --> Glue
+    MWAA -->|triggers| Glue
+    Glue -->|valid records| Silver
+    Glue -.->|invalid records| Quarantine[Quarantine\nInvalid Records]
+    Silver --> DBT
+    Gold --> Redshift
+    S3Raw -.->|quarantine bad batches| Quarantine
+    MWAA -.->|triggers dbt models| DBT
 
-    PG -->|"WAL (Write-Ahead Log)"| DMS
-    DMS -->|"Parquet files"| BRONZE
-    BRONZE --> GLUE
-    GLUE -->|valid records| SILVER
-    GLUE -.->|invalid records| QUARANTINE
-    SILVER --> DBT
-    DBT --> GOLD
-    GOLD --> RS
-    RS --> BI
-
-    MWAA -->|triggers Glue jobs| GLUE
-    MWAA -->|triggers dbt models| DBT
-    CW -->|structured events| AI
-    AI -->|auto-recover via Airflow API| MWAA
-    AI -.->|quarantine bad batches| QUARANTINE
+    classDef layer fill:#f0f4f8,stroke:#333,stroke-width:2px,rx:10,ry:10;
+    class Source,Control,Processing,Serving layer;
 ```
 
 ---
@@ -160,7 +149,7 @@ The agent watches all services at once, reasons across them using the Claude API
 
 Before any AWS infrastructure can be created with Terraform, Terraform itself needs somewhere to store its state. This repository creates the S3 (Simple Storage Service) buckets and DynamoDB tables that hold Terraform remote state for all three environments (dev, staging, prod). It runs once per AWS account and never changes after that.
 
-![DynamoDB lock table enterprise-data-platform-tf-lock-dev active in the dev account](images/aws-dynamo-db.png)
+![DynamoDB lock table enterprise-data-platform-tf-lock-dev active in the dev account](https://raw.githubusercontent.com/enterprise-data-platform-emeka/platform-docs/main/images/aws-dynamo-db.png)
 
 ---
 
@@ -168,9 +157,9 @@ Before any AWS infrastructure can be created with Terraform, Terraform itself ne
 
 All AWS infrastructure for the platform, organized as seven Terraform modules with a strict dependency order. Networking creates the VPC. Data-lake creates the S3 buckets. IAM-metadata creates the KMS key and IAM roles. Ingestion creates RDS and DMS. Processing creates Glue configuration and Athena. Serving creates Redshift Serverless. Orchestration creates the MWAA environment. Everything runs from a single `make apply dev` command.
 
-![VPC vpc-04 with 3 subnets, 3 route tables, and 3 network connections in eu-central-1](images/VPC-Subnets-RoutTable.png)
+![VPC vpc-04 with 3 subnets, 3 route tables, and 3 network connections in eu-central-1](https://raw.githubusercontent.com/enterprise-data-platform-emeka/platform-docs/main/images/VPC-Subnets-RoutTable.png)
 
-![All EDP S3 buckets in eu-central-1: bronze, silver, gold, quarantine, athena-results, glue-scripts, and mwaa-dags](images/AWS-S3-Buckets.png)
+![All EDP S3 buckets in eu-central-1: bronze, silver, gold, quarantine, athena-results, glue-scripts, and mwaa-dags](https://raw.githubusercontent.com/enterprise-data-platform-emeka/platform-docs/main/images/AWS-S3-Buckets.png)
 
 ---
 
@@ -184,7 +173,7 @@ A Python simulator that generates realistic e-commerce OLTP traffic against the 
 
 Six AWS Glue PySpark jobs that transform Bronze CDC data into the Silver star schema. The core challenge here is CDC reconciliation: DMS writes every insert, update, and delete as a separate file, so a single order can appear dozens of times across Bronze. Each job resolves all operations into a single current-state row per entity, validates it, and routes it to Silver or Quarantine. Jobs run identically in local Docker and AWS.
 
-![All six edp-dev Glue ETL jobs deployed in AWS Glue Studio running Glue 4.0](images/glue-etl-jobs.png)
+![All six edp-dev Glue ETL jobs deployed in AWS Glue Studio running Glue 4.0](https://raw.githubusercontent.com/enterprise-data-platform-emeka/platform-docs/main/images/glue-etl-jobs.png)
 
 ---
 
@@ -192,7 +181,7 @@ Six AWS Glue PySpark jobs that transform Bronze CDC data into the Silver star sc
 
 dbt models that transform Silver into the Gold analytics layer using Athena as the query engine. Fifteen models across three layers: staging views that clean and rename Silver columns, intermediate views that join related tables, and seven mart tables that answer specific business questions. All models are tested with dbt's built-in test framework. Runs locally against DuckDB for fast iteration and against AWS Athena for production.
 
-![Athena query editor showing monthly_revenue_trend Gold table with 10 rows returned from the edp_dev_gold database](images/Athena.png)
+![Athena query editor showing monthly_revenue_trend Gold table with 10 rows returned from the edp_dev_gold database](https://raw.githubusercontent.com/enterprise-data-platform-emeka/platform-docs/main/images/Athena.png)
 
 ---
 
@@ -200,9 +189,9 @@ dbt models that transform Silver into the Gold analytics layer using Athena as t
 
 The Airflow DAG (Directed Acyclic Graph) that chains the full pipeline together on a daily schedule. Six Glue jobs run in parallel, then a Glue Crawler updates the catalog, then dbt runs and tests. Includes a local Docker runner using the aws-mwaa-local-runner image so the full DAG can be tested before deploying to MWAA.
 
-![MWAA environment edp-dev-mwaa showing Available status running Airflow 2.9.2](images/MWAA-Airflow-AWS-Environment.png)
+![MWAA environment edp-dev-mwaa showing Available status running Airflow 2.9.2](https://raw.githubusercontent.com/enterprise-data-platform-emeka/platform-docs/main/images/MWAA-Airflow-AWS-Environment.png)
 
-![Airflow UI showing the edp_pipeline DAG graph with all 11 tasks green after a successful run](images/MWAA-Airflow-UI.png)
+![Airflow UI showing the edp_pipeline DAG graph with all 11 tasks green after a successful run](https://raw.githubusercontent.com/enterprise-data-platform-emeka/platform-docs/main/images/MWAA-Airflow-UI.png)
 
 ---
 
