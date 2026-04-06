@@ -1,6 +1,6 @@
 # Enterprise Data Platform (EDP)
 
-I built this platform to demonstrate a full production-grade data engineering pipeline on AWS (Amazon Web Services). It takes raw data from a PostgreSQL database, captures every change in real time, moves it through three transformation layers, and delivers business-ready aggregations to analysts through a dashboard. The same way it works inside real companies.
+I built this platform to demonstrate a full production-grade data engineering pipeline on AWS (Amazon Web Services). It takes raw data from a PostgreSQL database, captures every change in real time, moves it through three transformation layers, and delivers business-ready aggregations to analysts. The same way it works inside real companies.
 
 This is not a simplified demo. Every decision here (encryption, IAM (Identity and Access Management) roles, VPC (Virtual Private Cloud) isolation, error handling, testing, CI/CD) mirrors what a real engineering team would build. Each repository has its own detailed README explaining what it does, how to run it, and the reasoning behind every key decision.
 
@@ -13,38 +13,43 @@ flowchart TD
     subgraph Source ["Source Layer"]
         direction TB
         Postgres[PostgreSQL RDS\nWAL Log] --> DMS[AWS DMS CDC]
-        DMS --> S3Raw[S3 Data Lake\nBronze: Raw CDC Parquet]
-    end
-
-    subgraph Control ["Control Plane"]
-        direction TB
-        CW[CloudWatch + EventBridge] --> AI[AI Ops Agent\nECS Fargate + Claude]
-        AI --> MWAA[MWAA Airflow Orchestration]
-        MWAA -.->|auto-recover| AI
+        DMS --> S3Raw[S3 Bronze\nRaw CDC Parquet]
     end
 
     subgraph Processing ["Processing Layer"]
         direction TB
-        Glue[Glue PySpark\nBronze to Silver] --> Silver[Silver: Cleaned Parquet]
+        Glue[Glue PySpark\nBronze to Silver] --> Silver[S3 Silver\nCleaned Parquet]
         Silver --> DBT[dbt + Athena\nSilver to Gold]
-        DBT --> Gold[Gold: Aggregated Parquet]
+        DBT --> Gold[S3 Gold\nAggregated Parquet]
     end
 
     subgraph Serving ["Serving Layer"]
-        Redshift[Redshift Serverless + Spectrum] --> BI[BI Dashboards]
+        direction TB
+        Redshift[Redshift Serverless] --> BI[BI Dashboards]
+    end
+
+    subgraph Analytics ["Natural Language Analytics Agent"]
+        direction TB
+        NLQ[User NL Question] --> Agent[Analytics Agent\nECS Fargate + Claude API]
+        Agent --> SchemaRes[Schema Resolver\nGlue Catalog + dbt artifacts]
+        SchemaRes --> SQLGen[SQL Generator\nPartition-aware Athena SQL]
+        SQLGen --> Guardrails[Guardrails\nSELECT-only, cost check]
+        Guardrails --> Exec[Athena Execution]
+        Exec --> Validate[Result Validator\nSanity checks]
+        Validate --> Output[Chart + Insight + SQL\nAssumptions flagged]
     end
 
     S3Raw --> Glue
-    MWAA -->|triggers| Glue
-    Glue -->|valid records| Silver
-    Glue -.->|invalid records| Quarantine[Quarantine\nInvalid Records]
-    Silver --> DBT
+    MWAA[MWAA Airflow\nOrchestration] -->|triggers| Glue
+    MWAA -->|triggers dbt| DBT
+    Glue -.->|invalid records| Quarantine[S3 Quarantine]
     Gold --> Redshift
-    S3Raw -.->|quarantine bad batches| Quarantine
-    MWAA -.->|triggers dbt models| DBT
+    Gold --> SchemaRes
+    Exec -->|queries| Gold
+    DBT -.->|uploads dbt artifacts| SchemaRes
 
-    classDef layer fill:#f0f4f8,stroke:#333,stroke-width:2px,rx:10,ry:10;
-    class Source,Control,Processing,Serving layer;
+    classDef layer fill:#f0f4f8,stroke:#333,stroke-width:2px;
+    class Source,Processing,Serving,Analytics layer;
 ```
 
 ---
@@ -73,15 +78,21 @@ Step 6:  dbt runs SQL models using Athena as the query engine. It reads the Silv
          fact and dimension tables and produces seven Gold aggregation tables that
          answer specific business questions.
 
-Step 7:  Redshift Serverless uses Spectrum to query Gold directly from S3.
+Step 7:  After each successful dbt run, the pipeline uploads dbt schema artifacts
+         (manifest.json and catalog.json) to S3. The Analytics Agent reads these
+         artifacts to understand the business meaning behind every column, not just
+         the column name.
+
+Step 8:  Redshift Serverless uses Spectrum to query Gold directly from S3.
          No data loading required.
 
-Step 8:  BI tools connect to Redshift and analysts build dashboards.
+Step 9:  BI tools connect to Redshift and analysts build dashboards.
 
-Step 9:  The AI Operations Agent watches every layer continuously. For any failure
-         it diagnoses the root cause across all services, takes the right recovery
-         action, and sends a plain-English incident report via SNS
-         (Simple Notification Service).
+Step 10: The Natural Language Analytics Agent accepts plain-English questions from
+         users, resolves the correct Gold table from the dbt-enriched schema catalog,
+         generates partition-aware Athena SQL, checks the estimated scan cost before
+         executing, validates the results, produces a chart, and returns a plain-English
+         insight alongside the SQL it ran and every assumption it made.
 ```
 
 ---
@@ -110,11 +121,15 @@ dbt then reads Silver and produces seven Gold aggregation tables answering speci
 
 ---
 
-## The AI Operations Agent
+## The Natural Language Analytics Agent
 
-The platform adds an AI (Artificial Intelligence) Operations Agent that monitors every layer simultaneously. The problem it solves: when Glue fails because DMS paused 45 minutes earlier, AWS fires separate alerts for each service. Neither alert tells you the real cause. An engineer would start debugging Glue, which is the wrong place.
+The platform's final layer is an AI (Artificial Intelligence) agent that lets users query the Gold data layer in plain English without writing SQL.
 
-The agent watches all services at once, reasons across them using the Claude API, and acts on the root cause rather than the symptom. It can pause downstream jobs to prevent wasted runs, quarantine bad S3 batches, trigger Airflow retries, and post plain-English incident reports to SNS. It does not touch infrastructure or application code.
+The problem it solves: the Gold layer holds carefully curated, business-ready data, but getting value from it still requires an analyst who can write Athena SQL, knows the table and column names, and understands the partition structure well enough not to run expensive full-table scans. The analytics agent removes that barrier entirely.
+
+A user asks: "Show me monthly transaction volume for Berlin over the last 12 months." The agent resolves the correct Gold table from the dbt (data build tool) schema catalog, reads the partition structure from the Glue Catalog (Glue Data Catalog), generates an Athena SQL query with a partition filter to minimise scan cost, checks the estimated bytes scanned before executing, validates the result for obvious anomalies, produces a time-series chart, and returns a plain-English summary. It also flags every assumption it made (for example, "'transactions' interpreted as completed orders only") so the user can catch misinterpretations before acting on the insight.
+
+What makes this genuinely different from commercial natural language (NL) query products: Athena is a serverless query engine over S3 (Simple Storage Service), not a managed warehouse. The cost model is pay-per-byte-scanned, not per compute hour. A missing partition filter on a large table doesn't just run slowly — it costs real money. The agent reasons about S3 partition structures when generating SQL, which no off-the-shelf NL product does for Athena. It also combines two sources of schema metadata: the physical schema from the Glue Catalog (column names, types, partition keys) and the business context from dbt artifacts (column descriptions, model documentation, accepted values). Most text-to-SQL systems only see column names. This agent sees the business meaning behind every column.
 
 ---
 
@@ -123,21 +138,24 @@ The agent watches all services at once, reasons across them using the Claude API
 | Tool | What it is | How I use it |
 |---|---|---|
 | Terraform | Infrastructure-as-Code tool | Creates all AWS resources from code |
-| AWS S3 (Simple Storage Service) | Cloud file storage | Holds all data lake layers |
+| AWS S3 (Simple Storage Service) | Cloud file storage | Holds all data lake layers and dbt schema artifacts |
 | PostgreSQL on RDS (Relational Database Service) | Managed relational database | The data source |
 | AWS DMS | Managed database migration service | Captures CDC events and writes to Bronze |
 | AWS Glue | Managed Spark service | Runs PySpark jobs for Bronze to Silver |
 | Apache Spark / PySpark | Distributed data processing engine | The runtime inside Glue jobs |
-| dbt | SQL transformation framework | Runs SQL models for Silver to Gold |
-| Amazon Athena | Serverless SQL query engine | Executes dbt SQL against S3 data |
-| Redshift Serverless | Serverless data warehouse | Serves analyst queries |
+| AWS Glue Data Catalog | Metadata catalog | Stores live table schemas for Bronze, Silver, Gold |
+| dbt | SQL transformation framework | Runs SQL models for Silver to Gold; generates schema artifacts |
+| Amazon Athena | Serverless SQL query engine | Executes dbt SQL against S3 and runs analytics agent queries |
+| Redshift Serverless | Serverless data warehouse | Serves analyst queries via Spectrum over Gold |
 | Amazon MWAA | Managed Airflow service | Orchestrates and schedules the pipeline |
 | AWS KMS (Key Management Service) | Encryption key management | Encrypts all data at rest |
 | AWS IAM | Permission control | Least-privilege roles for every service |
-| AWS Glue Catalog | Metadata catalog | Stores table schemas for Bronze, Silver, Gold |
 | CloudWatch and EventBridge | Monitoring and event routing | Logs and structured events across all layers |
-| ECS (Elastic Container Service) Fargate | Serverless container runtime | Runs the AI Operations Agent |
-| Claude API (Anthropic) | Large language model | Powers the agent's cross-service reasoning |
+| ECS (Elastic Container Service) Fargate | Serverless container runtime | Runs the Natural Language Analytics Agent |
+| Claude API (Anthropic) | Large language model | Powers schema interpretation, SQL generation, and insight summarisation |
+| FastAPI | Python web framework | HTTP endpoint for the analytics agent |
+| matplotlib and Plotly | Charting libraries | Generates charts from query results |
+| sqlparse | SQL parsing library | Validates generated SQL before execution |
 | VPC | Private AWS network | Isolates all compute from the public internet |
 | AWS SSM (Systems Manager) Session Manager | Secure remote access | Port-forwarding tunnel to private RDS |
 
@@ -179,7 +197,7 @@ Six AWS Glue PySpark jobs that transform Bronze CDC data into the Silver star sc
 
 ### [platform-dbt-analytics](https://github.com/enterprise-data-platform-emeka/platform-dbt-analytics)
 
-dbt models that transform Silver into the Gold analytics layer using Athena as the query engine. Fifteen models across three layers: staging views that clean and rename Silver columns, intermediate views that join related tables, and seven mart tables that answer specific business questions. All models are tested with dbt's built-in test framework. Runs locally against DuckDB for fast iteration and against AWS Athena for production.
+dbt models that transform Silver into the Gold analytics layer using Athena as the query engine. Fifteen models across three layers: staging views that clean and rename Silver columns, intermediate views that join related tables, and seven mart tables that answer specific business questions. All models are tested with dbt's built-in test framework. Runs locally against DuckDB for fast iteration and against AWS Athena for production. After each successful run, the pipeline uploads dbt schema artifacts to S3 so the Analytics Agent always has current business-context metadata.
 
 ![Athena query editor showing monthly_revenue_trend Gold table with 10 rows returned from the edp_dev_gold database](images/Athena.png)
 
@@ -187,7 +205,7 @@ dbt models that transform Silver into the Gold analytics layer using Athena as t
 
 ### [platform-orchestration-mwaa-airflow](https://github.com/enterprise-data-platform-emeka/platform-orchestration-mwaa-airflow)
 
-The Airflow DAG (Directed Acyclic Graph) that chains the full pipeline together on a daily schedule. Six Glue jobs run in parallel, then a Glue Crawler updates the catalog, then dbt runs and tests. Includes a local Docker runner using the aws-mwaa-local-runner image so the full DAG can be tested before deploying to MWAA.
+The Airflow DAG (Directed Acyclic Graph) that chains the full pipeline together on a daily schedule. Six Glue jobs run in parallel, then a Glue Crawler updates the catalog, then dbt runs and tests, then dbt artifacts are uploaded to S3 for the Analytics Agent. Includes a local Docker runner using the aws-mwaa-local-runner image so the full DAG can be tested before deploying to MWAA.
 
 ![MWAA environment edp-dev-mwaa showing Available status running Airflow 2.9.2](images/MWAA-Airflow-AWS-Environment.png)
 
@@ -195,9 +213,9 @@ The Airflow DAG (Directed Acyclic Graph) that chains the full pipeline together 
 
 ---
 
-### platform-ops-agent *(in development)*
+### platform-analytics-agent *(in development)*
 
-The AI Operations Agent. An ECS Fargate task that subscribes to CloudWatch EventBridge events from every layer of the pipeline, uses the Claude API to reason about cross-service failures, takes recovery actions via the AWS SDK (Software Development Kit) and Airflow REST API, and reports incidents via SNS. Built last because it monitors everything else.
+The Natural Language Analytics Agent. An ECS Fargate task that accepts plain-English analytical questions, resolves the correct Gold table from the dbt-enriched Glue Catalog, generates partition-aware Athena SQL, validates and cost-checks the query before executing it, produces a chart, and returns a plain-English insight alongside every assumption it made. Built last because it consumes the Gold layer that everything else produces.
 
 ---
 
@@ -210,10 +228,10 @@ Each step depends on the previous. Do not skip steps.
 | 1 | terraform-bootstrap | Create remote state infrastructure |
 | 2-8 | terraform-platform-infra-live | Create all AWS platform infrastructure |
 | 9 | platform-cdc-simulator | Simulate source data for testing |
-| 10 | platform-glue-jobs | Build and deploy Bronze → Silver jobs |
-| 11 | platform-dbt-analytics | Build and deploy Silver → Gold models |
+| 10 | platform-glue-jobs | Build and deploy Bronze to Silver jobs |
+| 11 | platform-dbt-analytics | Build and deploy Silver to Gold models |
 | 12 | platform-orchestration-mwaa-airflow | Deploy the orchestration DAG |
-| 13 | platform-ops-agent | Deploy the AI Operations Agent |
+| 13 | platform-analytics-agent | Deploy the Natural Language Analytics Agent |
 
 ---
 
@@ -302,7 +320,7 @@ Open the MWAA web UI (find the URL in the AWS Console under MWAA or in the Terra
 ```
 silver_dim_customer  |
 silver_dim_product   |
-silver_fact_orders   +---> silver_complete -> run_silver_crawler -> gold_dbt_run -> gold_dbt_test -> pipeline_complete
+silver_fact_orders   +---> silver_complete -> run_silver_crawler -> gold_dbt_run -> gold_dbt_test -> upload_dbt_artifacts -> pipeline_complete
 silver_fact_payments |
 silver_fact_shipments|
 silver_fact_order_items
@@ -310,9 +328,20 @@ silver_fact_order_items
 
 All six Silver Glue jobs run in parallel. The rest runs sequentially. The full pipeline takes around 6-8 minutes.
 
-**Step 6: Verify the output**
+**Step 6: Verify the pipeline output**
 
 Query the Gold tables in the Athena console (workgroup: `edp-dev-workgroup`, database: `edp_dev_gold`). Or connect to Redshift Serverless and use Spectrum to query Gold directly from S3.
+
+**Step 7: Run the Analytics Agent**
+
+With Gold data in place and dbt artifacts uploaded, invoke the Analytics Agent with a plain-English question:
+
+Run in `platform-analytics-agent`:
+```bash
+python -m agent.main "Show monthly transaction volume for Berlin over the last 12 months"
+```
+
+The agent returns the SQL it ran, a chart PNG, a plain-English insight, and every assumption it made.
 
 ---
 
@@ -344,7 +373,7 @@ In `platform-orchestration-mwaa-airflow`, go to Actions, select "Trigger EDP Pip
 
 ## Prerequisites
 
-- AWS accounts for dev, staging, and prod with IAM Identity Center (SSO) configured
+- AWS accounts for dev, staging, and prod with IAM Identity Center (SSO (Single Sign-On)) configured
 - AWS CLI with profiles `dev-admin`, `staging-admin`, `prod-admin`
 - Terraform >= 1.6.0
 - Python 3.11.8 (managed with pyenv)
@@ -355,10 +384,10 @@ In `platform-orchestration-mwaa-airflow`, go to Actions, select "Trigger EDP Pip
 
 ## Security
 
-All data at rest is encrypted with a customer-managed KMS key. All S3 buckets block public access. RDS runs in private subnets with no public endpoint. DMS communicates with RDS within the VPC, never over the internet. Every service role follows least-privilege IAM. No credentials are hardcoded anywhere: passwords are stored in SSM (Systems Manager) Parameter Store as SecureString values and fetched at runtime.
+All data at rest is encrypted with a customer-managed KMS key. All S3 buckets block public access. RDS runs in private subnets with no public endpoint. DMS communicates with RDS within the VPC, never over the internet. Every service role follows least-privilege IAM. No credentials are hardcoded anywhere: passwords are stored in SSM (Systems Manager) Parameter Store as SecureString values and fetched at runtime. The Analytics Agent's IAM role is scoped to read-only Athena and Glue Catalog access on the Gold layer only. It cannot read Bronze or Silver data.
 
 ---
 
 ## Cost
 
-This platform uses a test-and-destroy workflow. Infrastructure is created, tested, and destroyed within a single session. A typical 2-3 hour test session costs around $0.50 to $1.00. The main costs are DMS (~$0.10/hr) and RDS (~$0.02/hr). Redshift Serverless auto-pauses when idle. MWAA on mw1.small runs ~$0.07/hr. Nothing is left running overnight.
+This platform uses a test-and-destroy workflow. Infrastructure is created, tested, and destroyed within a single session. A typical 2-3 hour test session costs around $1.50 to $2.50. The main pipeline costs are DMS (~$0.10/hr) and RDS (~$0.02/hr). MWAA on mw1.small runs ~$0.07/hr. Adding the Analytics Agent for a session of 50 queries adds approximately $1.35 (dominated by Claude API calls at ~$0.025 per query; Athena scan cost on Gold dev data is negligible). Nothing is left running overnight.
