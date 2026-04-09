@@ -320,7 +320,7 @@ Open the MWAA web UI (find the URL in the AWS Console under MWAA or in the Terra
 ```
 silver_dim_customer  |
 silver_dim_product   |
-silver_fact_orders   +---> silver_complete -> run_silver_crawler -> gold_dbt_run -> gold_dbt_test -> upload_dbt_artifacts -> pipeline_complete
+silver_fact_orders   +---> silver_complete -> run_silver_crawler -> gold_dbt_run -> gold_dbt_test -> pipeline_complete
 silver_fact_payments |
 silver_fact_shipments|
 silver_fact_order_items
@@ -347,27 +347,29 @@ The agent returns the SQL it ran, a chart PNG, a plain-English insight, and ever
 
 ### Path B: GitHub Actions run
 
-This path assumes all code is already deployed to AWS (infra, Glue jobs, dbt, DAG). Use it for production-style runs where the pipeline is triggered programmatically after code changes land.
+This is the standard path for this project. Infrastructure is created, the pipeline runs, then infrastructure is destroyed — all within a single session. Everything runs from GitHub Actions with no local commands needed beyond the initial Terraform apply.
 
-**Step 1: Deploy infrastructure (if changed)**
+**Daily build-and-destroy sequence**
 
-Push changes to `terraform-platform-infra-live`. The `deploy.yml` workflow runs automatically for dev and requires manual approval for staging and prod.
+| Step | What to trigger | How | Wait |
+|---|---|---|---|
+| 1 | `terraform-platform-infra-live` apply | Push or run `make apply dev` | ~10 min |
+| 2 | `platform-dbt-analytics` deploy | Triggers automatically after CI, or run manually | ~2 min (S3 sync only, no MWAA update) |
+| 3 | `platform-orchestration-mwaa-airflow` deploy | Triggers automatically after CI, or run manually | ~30 sec if requirements unchanged, ~35 min if packages changed |
+| 4 | Run `edp_pipeline` DAG | Trigger manually in the MWAA Airflow UI | ~6-8 min |
+| 5 | `platform-dbt-analytics` deploy (re-trigger) | Run manually from GitHub Actions | ~5 min (run-dbt now passes) |
+| 6 | Test | Query Gold in Athena, run the Analytics Agent | as needed |
+| 7 | `terraform-platform-infra-live` destroy | Run `make destroy dev` | ~5 min |
 
-**Step 2: Deploy Glue jobs (if changed)**
+**Why step 2 is fast:** The dbt project is not in plugins.zip. The `platform-dbt-analytics` deploy workflow syncs the project directly to S3 (`s3://{mwaa-bucket}/dbt/platform-dbt-analytics/`). MWAA workers download it at task runtime. Changing a dbt model and pushing takes effect on the next DAG run with no MWAA environment update.
 
-Push changes to `platform-glue-jobs`. The `deploy.yml` workflow uploads job scripts to S3 and updates the Glue job definitions.
+**Why step 3 only waits on first session (usually):** The 35-minute MWAA update only triggers when `requirements.txt` changes. On a daily build-and-destroy cycle, Python packages rarely change, so step 3 completes in ~30 seconds on most days.
 
-**Step 3: Deploy dbt models (if changed)**
+**Step 2 on first deploy (fresh environment):** The `run-dbt` job inside the `platform-dbt-analytics` deploy workflow will fail because Silver tables don't exist yet. That is expected. Run steps 3 and 4 first to populate Silver, then re-trigger step 2 (that is step 5 in the table above).
 
-Push changes to `platform-dbt-analytics`. The `ci.yml` workflow tests models against DuckDB. The `deploy.yml` workflow runs `dbt run` and `dbt test` against Athena in the target environment.
+**Triggering the DAG (step 4)**
 
-**Step 4: Deploy the DAG (if changed)**
-
-Push changes to `platform-orchestration-mwaa-airflow`. The `deploy.yml` workflow uploads the DAG to the MWAA S3 bucket. The new version appears in the MWAA UI within 30 seconds.
-
-**Step 5: Trigger the pipeline**
-
-In `platform-orchestration-mwaa-airflow`, go to Actions, select "Trigger EDP Pipeline", click "Run workflow", choose your environment (dev, staging, or prod), and click the green button. The workflow calls the MWAA API to trigger `edp_pipeline` and prints confirmation. Monitor progress in the MWAA UI.
+Go to the MWAA Airflow UI (URL in the AWS Console under MWAA), navigate to DAGs, find `edp_pipeline`, and click the play button. Monitor each task as it turns green. The full run takes 6-8 minutes.
 
 ---
 
