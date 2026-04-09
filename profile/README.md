@@ -353,17 +353,17 @@ This is the standard path for this project. Infrastructure is created, the pipel
 
 | Step | What to trigger | How | Wait |
 |---|---|---|---|
-| 1 | `terraform-platform-infra-live` apply | Push or run `make apply dev` | ~10 min |
-| 2 | `platform-dbt-analytics` deploy | Triggers automatically after CI, or run manually | ~2 min (S3 sync only, no MWAA update) |
-| 3 | `platform-orchestration-mwaa-airflow` deploy | Triggers automatically after CI, or run manually | ~30 sec if requirements unchanged, ~35 min if packages changed |
+| 1 | `terraform-platform-infra-live` apply | Run `make apply dev` | ~20-30 min (MWAA creation, packages pre-installed) |
+| 2 | `platform-dbt-analytics` deploy | Triggers automatically after CI, or run manually | ~seconds (S3 sync only) |
+| 3 | `platform-orchestration-mwaa-airflow` deploy | Triggers automatically after CI, or run manually | ~30 sec (DAG upload only) |
 | 4 | Run `edp_pipeline` DAG | Trigger manually in the MWAA Airflow UI | ~6-8 min |
 | 5 | `platform-dbt-analytics` deploy (re-trigger) | Run manually from GitHub Actions | ~5 min (run-dbt now passes) |
 | 6 | Test | Query Gold in Athena, run the Analytics Agent | as needed |
 | 7 | `terraform-platform-infra-live` destroy | Run `make destroy dev` | ~5 min |
 
-**Why step 2 is fast:** The dbt project is not in plugins.zip. The `platform-dbt-analytics` deploy workflow syncs the project directly to S3 (`s3://{mwaa-bucket}/dbt/platform-dbt-analytics/`). MWAA workers download it at task runtime. Changing a dbt model and pushing takes effect on the next DAG run with no MWAA environment update.
+**Why there is no 35-minute wait:** The MWAA runtime environment is infrastructure. Terraform owns `requirements.txt` and creates MWAA with all Python packages already installed. By the time MWAA reaches Available status, packages are ready. The `platform-orchestration-mwaa-airflow` deploy workflow only uploads DAG files (~30 seconds). It never calls `aws mwaa update-environment`.
 
-**Why step 3 only waits on first session (usually):** The 35-minute MWAA update only triggers when `requirements.txt` changes. On a daily build-and-destroy cycle, Python packages rarely change, so step 3 completes in ~30 seconds on most days.
+**A 35-minute MWAA update only happens when Python packages actually change.** That is a deliberate infrastructure change made by updating `modules/orchestration/requirements.txt` in `terraform-platform-infra-live` and running `terraform apply`. This happens rarely — changing a dbt model, a DAG, or any application code never triggers it.
 
 **Step 2 on first deploy (fresh environment):** The `run-dbt` job inside the `platform-dbt-analytics` deploy workflow will fail because Silver tables don't exist yet. That is expected. Run steps 3 and 4 first to populate Silver, then re-trigger step 2 (that is step 5 in the table above).
 
