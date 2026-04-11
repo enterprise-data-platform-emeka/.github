@@ -30,7 +30,8 @@ flowchart TD
 
     subgraph Analytics ["Natural Language Analytics Agent"]
         direction TB
-        NLQ[User NL Question] --> Agent[Analytics Agent\nECS Fargate + Claude API]
+        NLQ[User NL Question] --> Streamlit[Streamlit UI\nBrowser interface]
+        Streamlit --> Agent[Analytics Agent\nECS Fargate + Claude API]
         Agent --> SchemaRes[Schema Resolver\nGlue Catalog + dbt artifacts]
         SchemaRes --> SQLGen[SQL Generator\nPartition-aware Athena SQL]
         SQLGen --> Guardrails[Guardrails\nSELECT-only, cost check]
@@ -88,11 +89,14 @@ Step 8:  Redshift Serverless uses Spectrum to query Gold directly from S3.
 
 Step 9:  BI tools connect to Redshift and analysts build dashboards.
 
-Step 10: The Natural Language Analytics Agent accepts plain-English questions from
-         users, resolves the correct Gold table from the dbt-enriched schema catalog,
-         generates partition-aware Athena SQL, checks the estimated scan cost before
-         executing, validates the results, produces a chart, and returns a plain-English
-         insight alongside the SQL it ran and every assumption it made.
+Step 10: Non-technical stakeholders open the Streamlit browser interface and type
+         a plain-English question. Streamlit sends the question to the Analytics Agent
+         API. The agent resolves the correct Gold table from the dbt-enriched schema
+         catalog, generates partition-aware Athena SQL, checks the estimated scan cost
+         before executing, validates the results, produces a chart, and returns a
+         plain-English insight alongside the SQL it ran and every assumption it made.
+         Streamlit displays all of this inline: insight text, chart, SQL, assumptions,
+         and cost.
 ```
 
 ---
@@ -213,9 +217,11 @@ The Airflow DAG (Directed Acyclic Graph) that chains the full pipeline together 
 
 ---
 
-### platform-analytics-agent *(in development)*
+### platform-analytics-agent *(backend complete, Streamlit UI next)*
 
-The Natural Language Analytics Agent. An ECS Fargate task that accepts plain-English analytical questions, resolves the correct Gold table from the dbt-enriched Glue Catalog, generates partition-aware Athena SQL, validates and cost-checks the query before executing it, produces a chart, and returns a plain-English insight alongside every assumption it made. Built last because it consumes the Gold layer that everything else produces.
+The Natural Language Analytics Agent. The FastAPI backend is complete: an ECS Fargate task that accepts plain-English analytical questions, resolves the correct Gold table from the dbt-enriched Glue Catalog, generates partition-aware Athena SQL, validates and cost-checks the query before executing it, produces a chart, and returns a plain-English insight alongside every assumption it made.
+
+The next build item is the Streamlit browser interface: a Python web app that wraps the FastAPI backend so non-technical stakeholders can type a question in their browser and see the insight, inline chart, SQL, assumptions, and cost without any command-line access. Built for the demo video.
 
 ---
 
@@ -231,7 +237,9 @@ Each step depends on the previous. Do not skip steps.
 | 10 | platform-glue-jobs | Build and deploy Bronze to Silver jobs |
 | 11 | platform-dbt-analytics | Build and deploy Silver to Gold models |
 | 12 | platform-orchestration-mwaa-airflow | Deploy the orchestration DAG |
-| 13 | platform-analytics-agent | Deploy the Natural Language Analytics Agent |
+| 13 | platform-analytics-agent | Deploy the Natural Language Analytics Agent (FastAPI backend) |
+| 14 | platform-analytics-agent (Streamlit UI) | Browser interface for stakeholder demos |
+| 15 | platform-docs | Architecture decision records and diagrams |
 
 ---
 
