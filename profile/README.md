@@ -176,6 +176,17 @@ enterprise-data-platform/           ← monorepo root (local only)
 
 Each subdirectory is an independent git repository pushed to GitHub. The monorepo root is local only.
 
+| Repository | What it does |
+|---|---|
+| [terraform-bootstrap](https://github.com/enterprise-data-platform-emeka/terraform-bootstrap) | Creates the S3 remote state bucket and DynamoDB lock table Terraform needs, plus GitHub Actions OIDC roles. Nothing else can run until this exists. |
+| [terraform-platform-infra-live](https://github.com/enterprise-data-platform-emeka/terraform-platform-infra-live) | Provisions every AWS resource: VPC, S3 data lake, RDS PostgreSQL, DMS replication, Glue, MWAA, Redshift Serverless, and ECS Fargate for the analytics agent. |
+| [platform-cdc-simulator](https://github.com/enterprise-data-platform-emeka/platform-cdc-simulator) | Generates realistic PostgreSQL OLTP traffic (orders, customers, payments, shipments) so DMS has real CDC events to replicate into Bronze. |
+| [platform-glue-jobs](https://github.com/enterprise-data-platform-emeka/platform-glue-jobs) | Six PySpark jobs that reconcile Bronze CDC records into a clean Silver star schema, with type validation and a quarantine path for invalid records. |
+| [platform-dbt-analytics](https://github.com/enterprise-data-platform-emeka/platform-dbt-analytics) | dbt SQL models that aggregate Silver into seven Gold business tables in Apache Iceberg format. |
+| [platform-orchestration-mwaa-airflow](https://github.com/enterprise-data-platform-emeka/platform-orchestration-mwaa-airflow) | Airflow DAG on MWAA that orchestrates the full pipeline: six parallel Glue jobs, Glue Crawler, dbt run and test, then artifact upload for the analytics agent. |
+| [platform-analytics-agent](https://github.com/enterprise-data-platform-emeka/platform-analytics-agent) | FastAPI backend and Streamlit UI on ECS Fargate. Accepts plain-English questions, generates Athena SQL using Claude, and returns insights with interactive Plotly charts. |
+| [platform-teardown](https://github.com/enterprise-data-platform-emeka/platform-teardown) | GitHub Actions workflow to destroy all AWS infrastructure in one click. Run at the end of every session. |
+
 ---
 
 ## Module 1: terraform-bootstrap
@@ -201,7 +212,7 @@ terraform init
 terraform apply -var="profile=dev-admin"
 ```
 
-Run this once per AWS account. You get one S3 bucket (e.g. `edp-dev-158311564771-tfstate`) and one DynamoDB table (`edp-dev-tfstate-lock`).
+Run this once per AWS account. You get one S3 bucket (e.g. `edp-dev-<account-id>-tfstate`) and one DynamoDB table (`edp-dev-tfstate-lock`).
 
 ---
 
